@@ -116,6 +116,7 @@ async def handle_output_mask(message: Message, state: FSMContext) -> None:
         return
 
     await state.update_data(output_mask=mask)
+
     await state.set_state(ConversionStates.lines_per_file)
     await message.answer(
         "Если хочешь разделить результат на несколько файлов, введи количество строк на один файл.\n"
@@ -147,11 +148,14 @@ async def handle_lines_per_file(message: Message, state: FSMContext) -> None:
     await message.answer("Отлично! Теперь пришли файл в виде документа. Я верну его в нужном формате.")
 
 
+
 async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     input_mask = data.get("input_mask")
     output_mask = data.get("output_mask")
+
     lines_per_file = int(data.get("lines_per_file", 0) or 0)
+
 
     if not input_mask or not output_mask:
         await message.answer("Сначала отправь маски с помощью команды /start.")
@@ -204,6 +208,7 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
             await message.answer("Не удалось отправить файл. Попробуй файл меньшего размера.")
             return
 
+
     await state.clear()
 
 
@@ -221,7 +226,9 @@ async def main() -> None:
     dp.message.register(handle_start, CommandStart())
     dp.message.register(handle_cancel, Command(commands=["cancel"]))
     dp.message.register(handle_file, ConversionStates.waiting_file, F.document)
+
     dp.message.register(handle_lines_per_file, ConversionStates.lines_per_file, F.text)
+
     dp.message.register(handle_output_mask, ConversionStates.output_mask, F.text)
     dp.message.register(handle_input_mask, ConversionStates.input_mask, F.text)
 
