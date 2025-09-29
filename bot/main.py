@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import FSInputFile, Message
+from aiogram.types import BufferedInputFile, Message
 from dotenv import load_dotenv
 
 
@@ -149,10 +149,9 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
         await message.answer("Не удалось найти строки, подходящие под входную маску.")
         return
 
-    output_buffer = io.BytesIO("\n".join(converted_lines).encode("utf-8"))
-    output_buffer.seek(0)
+    output_bytes = "\n".join(converted_lines).encode("utf-8")
+    output_file = BufferedInputFile(output_bytes, filename="converted.txt")
 
-    output_file = FSInputFile(output_buffer, filename="converted.txt")
 
     try:
         await message.answer_document(output_file, caption="Готово! Вот преобразованный файл.")
