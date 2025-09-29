@@ -21,6 +21,7 @@ PLACEHOLDER_PATTERN = re.compile(r"\{([a-zA-Z_][\w-]*)\}")
 class ConversionStates(StatesGroup):
     input_mask = State()
     output_mask = State()
+    lines_per_file = State()
     waiting_file = State()
 
 
@@ -115,14 +116,46 @@ async def handle_output_mask(message: Message, state: FSMContext) -> None:
         return
 
     await state.update_data(output_mask=mask)
+
+    await state.set_state(ConversionStates.lines_per_file)
+    await message.answer(
+        "Если хочешь разделить результат на несколько файлов, введи количество строк на один файл.\n"
+        "Отправь 0 или слово 'skip', чтобы получить один файл.",
+    )
+
+
+async def handle_lines_per_file(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip().lower()
+
+    if not text:
+        await message.answer("Пожалуйста, введи число строк или 0, чтобы пропустить.")
+        return
+
+    if text in {"skip", "0", "нет", "no"}:
+        lines_per_file = 0
+    else:
+        try:
+            lines_per_file = int(text)
+        except ValueError:
+            await message.answer("Не удалось распознать число. Попробуй снова.")
+            return
+
+        if lines_per_file <= 0:
+            lines_per_file = 0
+
+    await state.update_data(lines_per_file=lines_per_file)
     await state.set_state(ConversionStates.waiting_file)
-    await message.answer("Теперь пришли файл в виде документа. Я верну его в нужном формате.")
+    await message.answer("Отлично! Теперь пришли файл в виде документа. Я верну его в нужном формате.")
+
 
 
 async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     input_mask = data.get("input_mask")
     output_mask = data.get("output_mask")
+
+    lines_per_file = int(data.get("lines_per_file", 0) or 0)
+
 
     if not input_mask or not output_mask:
         await message.answer("Сначала отправь маски с помощью команды /start.")
@@ -149,15 +182,32 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
         await message.answer("Не удалось найти строки, подходящие под входную маску.")
         return
 
-    output_bytes = "\n".join(converted_lines).encode("utf-8")
-    output_file = BufferedInputFile(output_bytes, filename="converted.txt")
+    chunks: List[List[str]]
+    if lines_per_file > 0:
+        chunks = [
+            converted_lines[idx : idx + lines_per_file]
+            for idx in range(0, len(converted_lines), lines_per_file)
+        ]
+    else:
+        chunks = [converted_lines]
 
+    if len(chunks) > 1:
+        await message.answer(f"Готово! Разбил результат на {len(chunks)} файла(ов).")
 
-    try:
-        await message.answer_document(output_file, caption="Готово! Вот преобразованный файл.")
-    except TelegramBadRequest:
-        await message.answer("Не удалось отправить файл. Попробуй файл меньшего размера.")
-        return
+    for idx, chunk in enumerate(chunks, start=1):
+        output_bytes = "\n".join(chunk).encode("utf-8")
+        filename = "converted.txt" if len(chunks) == 1 else f"converted_part_{idx}.txt"
+        output_file = BufferedInputFile(output_bytes, filename=filename)
+
+        try:
+            await message.answer_document(
+                output_file,
+                caption=("Готово! Вот преобразованный файл." if len(chunks) == 1 else None),
+            )
+        except TelegramBadRequest:
+            await message.answer("Не удалось отправить файл. Попробуй файл меньшего размера.")
+            return
+
 
     await state.clear()
 
@@ -176,6 +226,9 @@ async def main() -> None:
     dp.message.register(handle_start, CommandStart())
     dp.message.register(handle_cancel, Command(commands=["cancel"]))
     dp.message.register(handle_file, ConversionStates.waiting_file, F.document)
+
+    dp.message.register(handle_lines_per_file, ConversionStates.lines_per_file, F.text)
+
     dp.message.register(handle_output_mask, ConversionStates.output_mask, F.text)
     dp.message.register(handle_input_mask, ConversionStates.input_mask, F.text)
 
