@@ -152,6 +152,7 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
     output_bytes = "\n".join(converted_lines).encode("utf-8")
     output_file = BufferedInputFile(output_bytes, filename="converted.txt")
 
+
     try:
         await message.answer_document(output_file, caption="Готово! Вот преобразованный файл.")
     except TelegramBadRequest:
