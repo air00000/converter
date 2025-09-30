@@ -595,6 +595,7 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
             else "Готово! Вот преобразованный файл."
         )
         if not await _send_document(message, output_bytes, filename, caption):
+
             return
     else:
         archive_name = f"{stem}.zip"
@@ -612,6 +613,7 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
 
         archive_bytes = archive_buffer.getvalue()
         if not await _send_document(message, archive_bytes, archive_name, caption):
+
             return
 
     await state.clear()
@@ -686,6 +688,7 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
         )
 
         await _send_document(message, output_bytes, filename, caption)
+
         return
 
     archive_buffer = io.BytesIO()
@@ -714,6 +717,16 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
         caption,
     )
 
+
+    try:
+        await message.answer_document(
+            BufferedInputFile(archive_buffer.getvalue(), filename=archive_name),
+            caption=caption,
+        )
+    except TelegramBadRequest:
+        await message.answer(
+            "Не удалось отправить файл. Попробуй файл меньшего размера."
+        )
 
 async def main() -> None:
     load_dotenv()
