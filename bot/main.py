@@ -608,43 +608,6 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
             await message.answer("Готово! Обработал все доступные файлы по ссылке.")
 
 
-async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
-    document = message.document
-    if not document:
-        await message.answer("Пожалуйста, отправь файл как документ (не как фотографию).")
-        return
-
-    file = await bot.get_file(document.file_id)
-    buffer = io.BytesIO()
-    await bot.download_file(file.file_path, buffer)
-    buffer.seek(0)
-
-    await _convert_and_send(message, state, buffer.read())
-
-
-async def handle_file_link(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    match = URL_PATTERN.search(text)
-    if not match:
-        await message.answer(
-            "Пожалуйста, отправь документ или ссылку на файл в Google Drive или на Яндекс Диске."
-        )
-        return
-
-    url = _strip_trailing_punctuation(match.group(0))
-
-    try:
-        file_content, _ = await _download_file_from_link(url)
-    except ValueError as exc:
-        await message.answer(str(exc))
-        return
-    except aiohttp.ClientError:
-        await message.answer("Не удалось скачать файл по ссылке. Попробуй позже или отправь документ.")
-        return
-
-    await _convert_and_send(message, state, file_content)
-
-
 async def main() -> None:
     load_dotenv()
     token = os.environ.get("BOT_TOKEN")
