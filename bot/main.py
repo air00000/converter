@@ -6,12 +6,14 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Any, Iterable, List, Mapping, Optional, Tuple
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 import gdown
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
@@ -23,6 +25,9 @@ from dotenv import load_dotenv
 
 PLACEHOLDER_PATTERN = re.compile(r"\{([a-zA-Z_][\w-]*)\}")
 URL_PATTERN = re.compile(r"https?://\S+")
+
+TELEGRAM_FILE_LIMIT = 49 * 1024 * 1024  # 49 MiB with a safety margin under the 50 MiB API limit
+TEXT_FILE_SOFT_LIMIT = TELEGRAM_FILE_LIMIT - 512 * 1024  # leave room for ZIP overhead
 
 
 class ConversionStates(StatesGroup):
@@ -476,6 +481,83 @@ def _output_filename(stem: str, part_index: int, total_parts: int) -> str:
     return f"{stem}_part_{part_index}.txt"
 
 
+def _encode_lines(lines: Iterable[str]) -> bytes:
+    return "\n".join(lines).encode("utf-8")
+
+
+def _split_lines_to_fit(lines: List[str]) -> List[List[str]]:
+    encoded = _encode_lines(lines)
+    if len(encoded) <= TEXT_FILE_SOFT_LIMIT:
+        return [lines]
+
+    if len(lines) <= 1:
+        raise ValueError("Не удалось разбить результат на части, подходящие под ограничения Telegram.")
+
+    mid = len(lines) // 2
+    left = _split_lines_to_fit(lines[:mid])
+    right = _split_lines_to_fit(lines[mid:])
+    return left + right
+
+
+def _create_zip_archive(files: List[Tuple[str, bytes]]) -> bytes:
+    buffer = io.BytesIO()
+
+    def _write(target: io.BytesIO, compression: int, **kwargs: Any) -> None:
+        with ZipFile(target, "w", compression=compression, **kwargs) as archive:
+            for name, data in files:
+                archive.writestr(name, data)
+
+    try:
+        _write(buffer, ZIP_DEFLATED, compresslevel=9)
+    except RuntimeError:
+        buffer = io.BytesIO()
+        _write(buffer, ZIP_STORED)
+
+    buffer.seek(0)
+    return buffer.read()
+
+
+def _group_into_archives(
+    files: List[Tuple[str, bytes]], stem: str
+) -> List[Tuple[str, bytes]]:
+    if not files:
+        return []
+
+    archives: List[Tuple[List[Tuple[str, bytes]], bytes]] = []
+    current_files: List[Tuple[str, bytes]] = []
+    current_bytes: Optional[bytes] = None
+
+    for file in files:
+        candidate_files = current_files + [file]
+        candidate_bytes = _create_zip_archive(candidate_files)
+
+        if not current_files or len(candidate_bytes) <= TELEGRAM_FILE_LIMIT:
+            current_files = candidate_files
+            current_bytes = candidate_bytes
+            continue
+
+        if current_bytes is None:
+            raise ValueError("Не удалось сформировать архив, подходящий под ограничения Telegram.")
+
+        archives.append((current_files, current_bytes))
+        current_files = [file]
+        current_bytes = _create_zip_archive(current_files)
+
+        if len(current_bytes) > TELEGRAM_FILE_LIMIT:
+            raise ValueError("Даже один файл после разбиения превышает ограничения Telegram.")
+
+    if current_files and current_bytes is not None:
+        archives.append((current_files, current_bytes))
+
+    total_archives = len(archives)
+    result: List[Tuple[str, bytes]] = []
+    for index, (_, archive_bytes) in enumerate(archives, start=1):
+        filename = f"{stem}.zip" if total_archives == 1 else f"{stem}_part_{index}.zip"
+        result.append((filename, archive_bytes))
+
+    return result
+
+
 async def _convert_and_send(
     message: Message,
     state: FSMContext,
@@ -513,25 +595,61 @@ async def _convert_and_send(
     else:
         chunks = [converted_lines]
 
-    if len(chunks) > 1:
+    split_chunks: List[List[str]] = []
+    for chunk in chunks:
+        try:
+            split_chunks.extend(_split_lines_to_fit(chunk))
+        except ValueError:
+            await message.answer(
+                "Не удалось подготовить файлы: даже после разбиения они превышают ограничения Telegram."
+            )
+            return False
+
+    total_parts = len(split_chunks)
+    if total_parts > 1:
         details = f" для {source_name}" if source_name else ""
         await message.answer(
-            f"Готово! Разбил результат на {len(chunks)} файла(ов){details}."
+            f"Готово! Разбил результат на {total_parts} файла(ов){details}."
         )
 
     stem = _output_stem_from_source(source_name)
-    for idx, chunk in enumerate(chunks, start=1):
-        output_bytes = "\n".join(chunk).encode("utf-8")
-        filename = _output_filename(stem, idx, len(chunks))
-        output_file = BufferedInputFile(output_bytes, filename=filename)
+    files_with_data: List[Tuple[str, bytes]] = []
+    for idx, chunk in enumerate(split_chunks, start=1):
+        output_bytes = _encode_lines(chunk)
+        filename = _output_filename(stem, idx, total_parts)
+        files_with_data.append((filename, output_bytes))
 
-        caption: Optional[str]
-        if len(chunks) == 1:
+    try:
+        archives = _group_into_archives(files_with_data, stem)
+    except ValueError:
+        await message.answer(
+            "Не удалось сформировать архив в пределах ограничения Telegram. Попробуй уменьшить размер файлов."
+        )
+        return False
+
+    if not archives:
+        await message.answer("Не удалось подготовить архив для отправки.")
+        return False
+
+    total_archives = len(archives)
+    if total_archives > 1:
+        details = f" для {source_name}" if source_name else ""
+        await message.answer(
+            f"Файлы упакованы в {total_archives} архив(ов){details}. Отправляю..."
+        )
+
+    for idx, (archive_name, archive_bytes) in enumerate(archives, start=1):
+        output_file = BufferedInputFile(archive_bytes, filename=archive_name)
+
+        if total_archives == 1:
             caption = (
-                f"Готово! Вот преобразованный файл для {source_name}."
+                f"Готово! Вот архив с преобразованным файлом для {source_name}."
                 if source_name
-                else "Готово! Вот преобразованный файл."
+                else "Готово! Вот архив с преобразованным файлом."
             )
+        elif idx == 1:
+            details = f" для {source_name}" if source_name else ""
+            caption = f"Готово! Архив {idx} из {total_archives}{details}."
         else:
             caption = None
 
@@ -539,7 +657,7 @@ async def _convert_and_send(
             await message.answer_document(output_file, caption=caption)
         except TelegramBadRequest:
             await message.answer(
-                "Не удалось отправить файл. Попробуй файл меньшего размера."
+                "Не удалось отправить архив. Попробуй уменьшить размер файлов."
             )
             return False
 
@@ -616,7 +734,7 @@ async def main() -> None:
 
     logging.basicConfig(level=logging.INFO)
 
-    bot = Bot(token=token, parse_mode=ParseMode.HTML)
+    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
 
     dp.message.register(handle_start, CommandStart())
