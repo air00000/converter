@@ -510,6 +510,7 @@ def _output_filename(stem: str, part_index: int, total_parts: int) -> str:
     return f"{stem}_part_{part_index}.txt"
 
 
+
 def _zip_entries(entries: Iterable[Tuple[str, bytes]]) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
@@ -568,7 +569,6 @@ def _split_entries_into_archives(
         named_archives.append((archive_name, archive_bytes))
 
     return named_archives, None
-
 
 async def _convert_file_to_outputs(
     message: Message,
@@ -658,6 +658,7 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
             return
     else:
         caption_base = (
+
             f"Готово! Вот архив с результатами для {document.file_name}."
             if document.file_name
             else "Готово! Вот архив с результатами."
@@ -805,6 +806,17 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
         if not await _send_document(message, archive_bytes, archive_name, caption):
             return
 
+
+
+    try:
+        await message.answer_document(
+            BufferedInputFile(archive_buffer.getvalue(), filename=archive_name),
+            caption=caption,
+        )
+    except TelegramBadRequest:
+        await message.answer(
+            "Не удалось отправить файл. Попробуй файл меньшего размера."
+        )
 
 async def main() -> None:
     load_dotenv()
