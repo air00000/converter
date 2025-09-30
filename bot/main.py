@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
@@ -476,12 +477,12 @@ def _output_filename(stem: str, part_index: int, total_parts: int) -> str:
     return f"{stem}_part_{part_index}.txt"
 
 
-async def _convert_and_send(
+async def _convert_file_to_outputs(
     message: Message,
     state: FSMContext,
     file_content: bytes,
     source_name: Optional[str] = None,
-) -> bool:
+) -> Optional[Tuple[str, List[Tuple[str, bytes]]]]:
 
     data = await state.get_data()
     input_mask = data.get("input_mask")
@@ -491,7 +492,7 @@ async def _convert_and_send(
 
     if not input_mask or not output_mask:
         await message.answer("Сначала отправь маски с помощью команды /start.")
-        return False
+        return None
 
 
     text = file_content.decode("utf-8", errors="ignore")
@@ -499,11 +500,11 @@ async def _convert_and_send(
         converted_lines = _convert_lines(text.splitlines(), input_mask, output_mask)
     except ValueError as exc:
         await message.answer(f"Не удалось преобразовать файл: {exc}")
-        return False
+        return None
 
     if not converted_lines:
         await message.answer("Не удалось найти строки, подходящие под входную маску.")
-        return False
+        return None
 
     if lines_per_file > 0:
         chunks = [
@@ -520,30 +521,14 @@ async def _convert_and_send(
         )
 
     stem = _output_stem_from_source(source_name)
+    outputs: List[Tuple[str, bytes]] = []
+
     for idx, chunk in enumerate(chunks, start=1):
         output_bytes = "\n".join(chunk).encode("utf-8")
         filename = _output_filename(stem, idx, len(chunks))
-        output_file = BufferedInputFile(output_bytes, filename=filename)
+        outputs.append((filename, output_bytes))
 
-        caption: Optional[str]
-        if len(chunks) == 1:
-            caption = (
-                f"Готово! Вот преобразованный файл для {source_name}."
-                if source_name
-                else "Готово! Вот преобразованный файл."
-            )
-        else:
-            caption = None
-
-        try:
-            await message.answer_document(output_file, caption=caption)
-        except TelegramBadRequest:
-            await message.answer(
-                "Не удалось отправить файл. Попробуй файл меньшего размера."
-            )
-            return False
-
-    return True
+    return stem, outputs
 
 
 async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
@@ -557,15 +542,59 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
     await bot.download_file(file.file_path, buffer)
     buffer.seek(0)
 
-    success = await _convert_and_send(
+    result = await _convert_file_to_outputs(
         message,
         state,
         buffer.read(),
         source_name=document.file_name,
     )
 
-    if success:
-        await state.clear()
+    if not result:
+        return
+
+    stem, outputs = result
+
+    if len(outputs) == 1:
+        filename, output_bytes = outputs[0]
+        caption = (
+            f"Готово! Вот преобразованный файл для {document.file_name}."
+            if document.file_name
+            else "Готово! Вот преобразованный файл."
+        )
+        output_file = BufferedInputFile(output_bytes, filename=filename)
+        try:
+            await message.answer_document(output_file, caption=caption)
+        except TelegramBadRequest:
+            await message.answer(
+                "Не удалось отправить файл. Попробуй файл меньшего размера."
+            )
+            return
+    else:
+        archive_name = f"{stem}.zip"
+        archive_buffer = io.BytesIO()
+        with zipfile.ZipFile(archive_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for filename, output_bytes in outputs:
+                zip_file.writestr(filename, output_bytes)
+        archive_buffer.seek(0)
+
+        caption = (
+            f"Готово! Вот архив с результатами для {document.file_name}."
+            if document.file_name
+            else "Готово! Вот архив с результатами."
+        )
+
+        try:
+            await message.answer_document(
+                BufferedInputFile(archive_buffer.getvalue(), filename=archive_name),
+                caption=caption,
+            )
+        except TelegramBadRequest:
+            await message.answer(
+                "Не удалось отправить файл. Попробуй файл меньшего размера."
+            )
+            return
+
+    await state.clear()
 
 
 async def handle_file_link(message: Message, state: FSMContext) -> None:
@@ -597,16 +626,84 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
             f"Нашёл {len(files)} файла(ов) по ссылке. Начинаю обработку..."
         )
 
+    converted_entries: List[Tuple[str, bytes]] = []
+    archive_stem: Optional[str] = None
+    single_source_name: Optional[str] = None
     success_any = False
+
     for content, name in sorted(files, key=lambda item: item[1] or ""):
-        success = await _convert_and_send(message, state, content, source_name=name)
-        success_any = success_any or success
+        result = await _convert_file_to_outputs(message, state, content, source_name=name)
+        if not result:
+            continue
 
-    if success_any:
-        await state.clear()
-        if len(files) > 1:
-            await message.answer("Готово! Обработал все доступные файлы по ссылке.")
+        success_any = True
+        stem, outputs = result
+        if len(files) == 1:
+            archive_stem = stem
+            single_source_name = name
 
+        for filename, output_bytes in outputs:
+            relative_path = filename
+            if len(files) > 1:
+                relative_path = f"{stem}/{filename}"
+            converted_entries.append((relative_path, output_bytes))
+
+    if not success_any:
+        return
+
+    await state.clear()
+
+    if not converted_entries:
+        await message.answer("Не удалось подготовить файлы для отправки.")
+        return
+
+    if len(converted_entries) == 1 and len(files) == 1:
+        filename, output_bytes = converted_entries[0]
+        caption = (
+            f"Готово! Вот преобразованный файл для {single_source_name}."
+            if single_source_name
+            else "Готово! Вот преобразованный файл."
+        )
+
+        try:
+            await message.answer_document(
+                BufferedInputFile(output_bytes, filename=filename),
+                caption=caption,
+            )
+        except TelegramBadRequest:
+            await message.answer(
+                "Не удалось отправить файл. Попробуй файл меньшего размера."
+            )
+        return
+
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for relative_path, output_bytes in converted_entries:
+            zip_file.writestr(relative_path, output_bytes)
+    archive_buffer.seek(0)
+
+    if len(files) > 1:
+        archive_name = "converted_files.zip"
+    else:
+        archive_name = f"{(archive_stem or 'converted')}.zip"
+
+    caption = "Готово! Вот архив с результатами."
+    if len(files) > 1:
+        caption = (
+            "Готово! Обработал все доступные файлы по ссылке. Вот архив с результатами."
+        )
+    elif single_source_name:
+        caption = f"Готово! Вот архив с результатами для {single_source_name}."
+
+    try:
+        await message.answer_document(
+            BufferedInputFile(archive_buffer.getvalue(), filename=archive_name),
+            caption=caption,
+        )
+    except TelegramBadRequest:
+        await message.answer(
+            "Не удалось отправить файл. Попробуй файл меньшего размера."
+        )
 
 async def main() -> None:
     load_dotenv()
