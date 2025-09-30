@@ -22,8 +22,41 @@ from aiogram.types import BufferedInputFile, Message
 from dotenv import load_dotenv
 
 
+MAX_TELEGRAM_FILE_SIZE = 49 * 1024 * 1024
+
 PLACEHOLDER_PATTERN = re.compile(r"\{([a-zA-Z_][\w-]*)\}")
 URL_PATTERN = re.compile(r"https?://\S+")
+
+
+async def _send_document(
+    message: Message,
+    file_bytes: bytes,
+    filename: str,
+    caption: str,
+) -> bool:
+    size = len(file_bytes)
+    if size > MAX_TELEGRAM_FILE_SIZE:
+        size_mb = size / (1024 * 1024)
+        await message.answer(
+            (
+                "Не удалось отправить файл, потому что его размер превышает ограничение Telegram "
+                f"({size_mb:.1f} МБ). Попробуй уменьшить размер файла или разбить результат на части."
+            )
+        )
+        return False
+
+    try:
+        await message.answer_document(
+            BufferedInputFile(file_bytes, filename=filename),
+            caption=caption,
+        )
+        return True
+    except (TelegramBadRequest, aiohttp.ClientError, ConnectionError) as exc:
+        logging.exception("Failed to send document %s", filename, exc_info=exc)
+        await message.answer(
+            "Не удалось отправить файл из-за проблемы с соединением. Попробуй ещё раз чуть позже."
+        )
+        return False
 
 
 class ConversionStates(StatesGroup):
@@ -561,13 +594,8 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
             if document.file_name
             else "Готово! Вот преобразованный файл."
         )
-        output_file = BufferedInputFile(output_bytes, filename=filename)
-        try:
-            await message.answer_document(output_file, caption=caption)
-        except TelegramBadRequest:
-            await message.answer(
-                "Не удалось отправить файл. Попробуй файл меньшего размера."
-            )
+        if not await _send_document(message, output_bytes, filename, caption):
+
             return
     else:
         archive_name = f"{stem}.zip"
@@ -583,15 +611,9 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
             else "Готово! Вот архив с результатами."
         )
 
-        try:
-            await message.answer_document(
-                BufferedInputFile(archive_buffer.getvalue(), filename=archive_name),
-                caption=caption,
-            )
-        except TelegramBadRequest:
-            await message.answer(
-                "Не удалось отправить файл. Попробуй файл меньшего размера."
-            )
+        archive_bytes = archive_buffer.getvalue()
+        if not await _send_document(message, archive_bytes, archive_name, caption):
+
             return
 
     await state.clear()
@@ -665,15 +687,8 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
             else "Готово! Вот преобразованный файл."
         )
 
-        try:
-            await message.answer_document(
-                BufferedInputFile(output_bytes, filename=filename),
-                caption=caption,
-            )
-        except TelegramBadRequest:
-            await message.answer(
-                "Не удалось отправить файл. Попробуй файл меньшего размера."
-            )
+        await _send_document(message, output_bytes, filename, caption)
+
         return
 
     archive_buffer = io.BytesIO()
@@ -694,6 +709,14 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
         )
     elif single_source_name:
         caption = f"Готово! Вот архив с результатами для {single_source_name}."
+
+    await _send_document(
+        message,
+        archive_buffer.getvalue(),
+        archive_name,
+        caption,
+    )
+
 
     try:
         await message.answer_document(
