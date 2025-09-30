@@ -13,6 +13,7 @@ import aiohttp
 import gdown
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
@@ -108,8 +109,6 @@ async def _answer_with_retry(message: Message, text: str, **kwargs: Any) -> None
             return
 
     logging.warning("Failed to send message '%s' after retries", text)
-
-
 
 class ConversionStates(StatesGroup):
     input_mask = State()
@@ -577,8 +576,6 @@ def _output_filename(stem: str, part_index: int, total_parts: int) -> str:
         return f"{stem}.txt"
     return f"{stem}_part_{part_index}.txt"
 
-
-
 def _zip_entries(entries: Iterable[Tuple[str, bytes]]) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
@@ -637,7 +634,7 @@ def _split_entries_into_archives(
         named_archives.append((archive_name, archive_bytes))
 
     return named_archives, None
-
+  
 async def _convert_file_to_outputs(
     message: Message,
     state: FSMContext,
@@ -925,7 +922,6 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
     await _answer_with_retry(message, "Обработка завершена.")
 
 
-
     try:
         await message.answer_document(
             BufferedInputFile(archive_buffer.getvalue(), filename=archive_name),
@@ -944,7 +940,7 @@ async def main() -> None:
 
     logging.basicConfig(level=logging.INFO)
 
-    bot = Bot(token=token, parse_mode=ParseMode.HTML)
+    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
 
     dp.message.register(handle_start, CommandStart())
