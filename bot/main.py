@@ -110,6 +110,7 @@ async def _answer_with_retry(message: Message, text: str, **kwargs: Any) -> None
     logging.warning("Failed to send message '%s' after retries", text)
 
 
+
 class ConversionStates(StatesGroup):
     input_mask = State()
     output_mask = State()
@@ -577,6 +578,7 @@ def _output_filename(stem: str, part_index: int, total_parts: int) -> str:
     return f"{stem}_part_{part_index}.txt"
 
 
+
 def _zip_entries(entries: Iterable[Tuple[str, bytes]]) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
@@ -636,7 +638,6 @@ def _split_entries_into_archives(
 
     return named_archives, None
 
-
 async def _convert_file_to_outputs(
     message: Message,
     state: FSMContext,
@@ -655,6 +656,7 @@ async def _convert_file_to_outputs(
             message,
             "Сначала отправь маски с помощью команды /start.",
         )
+
         return None
 
 
@@ -673,6 +675,7 @@ async def _convert_file_to_outputs(
             message,
             "Не удалось найти строки, подходящие под входную маску.",
         )
+
         return None
 
     if lines_per_file > 0:
@@ -738,6 +741,7 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
             return
     else:
         caption_base = (
+
             f"Готово! Вот архив с результатами для {document.file_name}."
             if document.file_name
             else "Готово! Вот архив с результатами."
@@ -752,6 +756,7 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
                 "Не удалось отправить файл "
                 f"{filename}, потому что его размер после конвертации составляет {size_mb:.1f} МБ. "
                 "Попробуй уменьшить размер результата, например, уменьшив число строк в одном файле.",
+
             )
             return
 
@@ -767,6 +772,7 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
                 message,
                 "Итоговый архив получился слишком большим, поэтому разбил результаты на "
                 f"{len(archives)} части.",
+
             )
 
         total_parts = len(archives)
@@ -780,6 +786,7 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
                 return
 
         await _answer_with_retry(message, "Обработка завершена.")
+
 
     await state.clear()
 
@@ -853,6 +860,7 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
             message,
             "Не удалось подготовить файлы для отправки.",
         )
+
         return
 
     if len(converted_entries) == 1 and len(files) == 1:
@@ -885,6 +893,7 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
             "Не удалось отправить файл "
             f"{filename}, потому что его размер после конвертации составляет {size_mb:.1f} МБ. "
             "Попробуй уменьшить размер результата, например, уменьшив число строк в одном файле.",
+
         )
         return
 
@@ -900,6 +909,7 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
             message,
             "Итоговый архив получился слишком большим, поэтому разбил результаты на "
             f"{len(archives)} части.",
+
         )
 
     total_parts = len(archives)
@@ -914,6 +924,17 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
 
     await _answer_with_retry(message, "Обработка завершена.")
 
+
+
+    try:
+        await message.answer_document(
+            BufferedInputFile(archive_buffer.getvalue(), filename=archive_name),
+            caption=caption,
+        )
+    except TelegramBadRequest:
+        await message.answer(
+            "Не удалось отправить файл. Попробуй файл меньшего размера."
+        )
 
 async def main() -> None:
     load_dotenv()
