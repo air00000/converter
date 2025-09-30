@@ -705,7 +705,6 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
             "Не удалось отправить файл. Попробуй файл меньшего размера."
         )
 
-
 async def main() -> None:
     load_dotenv()
     token = os.environ.get("BOT_TOKEN")
