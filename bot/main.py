@@ -14,7 +14,7 @@ import gdown
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -37,26 +37,78 @@ async def _send_document(
     size = len(file_bytes)
     if size > MAX_TELEGRAM_FILE_SIZE:
         size_mb = size / (1024 * 1024)
-        await message.answer(
+        await _answer_with_retry(
+            message,
             (
                 "Не удалось отправить файл, потому что его размер превышает ограничение Telegram "
                 f"({size_mb:.1f} МБ). Попробуй уменьшить размер файла или разбить результат на части."
-            )
+            ),
         )
         return False
 
-    try:
-        await message.answer_document(
-            BufferedInputFile(file_bytes, filename=filename),
-            caption=caption,
-        )
-        return True
-    except (TelegramBadRequest, aiohttp.ClientError, ConnectionError) as exc:
-        logging.exception("Failed to send document %s", filename, exc_info=exc)
-        await message.answer(
-            "Не удалось отправить файл из-за проблемы с соединением. Попробуй ещё раз чуть позже."
-        )
-        return False
+    retries_left = 3
+    while retries_left > 0:
+        try:
+            await message.answer_document(
+                BufferedInputFile(file_bytes, filename=filename),
+                caption=caption,
+            )
+            return True
+        except TelegramRetryAfter as exc:
+            retries_left -= 1
+            await asyncio.sleep(exc.retry_after + 1)
+        except TelegramBadRequest as exc:
+            retry_after = _extract_retry_after_seconds(str(exc))
+            if retry_after is not None and retries_left > 1:
+                retries_left -= 1
+                await asyncio.sleep(retry_after + 1)
+                continue
+            logging.exception("Failed to send document %s", filename, exc_info=exc)
+            break
+        except (aiohttp.ClientError, ConnectionError) as exc:
+            logging.exception("Failed to send document %s", filename, exc_info=exc)
+            break
+
+    await _answer_with_retry(
+        message,
+        "Не удалось отправить файл из-за проблемы с соединением. Попробуй ещё раз чуть позже.",
+    )
+    return False
+
+
+def _extract_retry_after_seconds(message: str) -> Optional[int]:
+    match = re.search(r"retry after (?P<seconds>\d+)", message, re.IGNORECASE)
+    if match:
+        try:
+            return int(match.group("seconds"))
+        except ValueError:
+            return None
+    return None
+
+
+async def _answer_with_retry(message: Message, text: str, **kwargs: Any) -> None:
+    retries_left = 3
+    while retries_left > 0:
+        try:
+            await message.answer(text, **kwargs)
+            return
+        except TelegramRetryAfter as exc:
+            retries_left -= 1
+            await asyncio.sleep(exc.retry_after + 1)
+        except TelegramBadRequest as exc:
+            retry_after = _extract_retry_after_seconds(str(exc))
+            if retry_after is not None and retries_left > 1:
+                retries_left -= 1
+                await asyncio.sleep(retry_after + 1)
+                continue
+            logging.exception("Failed to send message '%s'", text, exc_info=exc)
+            return
+        except (aiohttp.ClientError, ConnectionError) as exc:
+            logging.exception("Failed to send message '%s'", text, exc_info=exc)
+            return
+
+    logging.warning("Failed to send message '%s' after retries", text)
+
 
 
 class ConversionStates(StatesGroup):
@@ -419,7 +471,8 @@ async def _download_files_from_link(url: str) -> List[Tuple[bytes, Optional[str]
 
 async def handle_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(
+    await _answer_with_retry(
+        message,
         "👋 Привет! Отправь мне маску текущей структуры строк файла.\n"
         "Используй плейсхолдеры в фигурных скобках, например:\n"
         "`{protocol}://{domain}:{username}:{password}`",
@@ -430,7 +483,10 @@ async def handle_start(message: Message, state: FSMContext) -> None:
 
 async def handle_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Сбросил текущую операцию. Напиши /start, чтобы начать заново.")
+    await _answer_with_retry(
+        message,
+        "Сбросил текущую операцию. Напиши /start, чтобы начать заново.",
+    )
 
 
 async def handle_input_mask(message: Message, state: FSMContext) -> None:
@@ -438,12 +494,13 @@ async def handle_input_mask(message: Message, state: FSMContext) -> None:
     try:
         _mask_to_regex(mask)
     except ValueError as exc:
-        await message.answer(str(exc))
+        await _answer_with_retry(message, str(exc))
         return
 
     await state.update_data(input_mask=mask)
     await state.set_state(ConversionStates.output_mask)
-    await message.answer(
+    await _answer_with_retry(
+        message,
         "Отлично! Теперь отправь маску нужной структуры.\n"
         "Используй те же имена плейсхолдеров, например: `{username}:{password}`",
         parse_mode=ParseMode.MARKDOWN,
@@ -453,13 +510,17 @@ async def handle_input_mask(message: Message, state: FSMContext) -> None:
 async def handle_output_mask(message: Message, state: FSMContext) -> None:
     mask = message.text or ""
     if not PLACEHOLDER_PATTERN.search(mask):
-        await message.answer("В маске должен быть хотя бы один плейсхолдер в фигурных скобках.")
+        await _answer_with_retry(
+            message,
+            "В маске должен быть хотя бы один плейсхолдер в фигурных скобках.",
+        )
         return
 
     await state.update_data(output_mask=mask)
 
     await state.set_state(ConversionStates.lines_per_file)
-    await message.answer(
+    await _answer_with_retry(
+        message,
         "Если хочешь разделить результат на несколько файлов, введи количество строк на один файл.\n"
         "Отправь 0 или слово 'skip', чтобы получить один файл.",
     )
@@ -469,7 +530,10 @@ async def handle_lines_per_file(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip().lower()
 
     if not text:
-        await message.answer("Пожалуйста, введи число строк или 0, чтобы пропустить.")
+        await _answer_with_retry(
+            message,
+            "Пожалуйста, введи число строк или 0, чтобы пропустить.",
+        )
         return
 
     if text in {"skip", "0", "нет", "no"}:
@@ -478,7 +542,10 @@ async def handle_lines_per_file(message: Message, state: FSMContext) -> None:
         try:
             lines_per_file = int(text)
         except ValueError:
-            await message.answer("Не удалось распознать число. Попробуй снова.")
+            await _answer_with_retry(
+                message,
+                "Не удалось распознать число. Попробуй снова.",
+            )
             return
 
         if lines_per_file <= 0:
@@ -486,9 +553,10 @@ async def handle_lines_per_file(message: Message, state: FSMContext) -> None:
 
     await state.update_data(lines_per_file=lines_per_file)
     await state.set_state(ConversionStates.waiting_file)
-    await message.answer(
+    await _answer_with_retry(
+        message,
         "Отлично! Теперь пришли файл в виде документа или ссылку на файл/папку. "
-        "Я верну его в нужном формате."
+        "Я верну его в нужном формате.",
     )
 
 
@@ -584,7 +652,11 @@ async def _convert_file_to_outputs(
     lines_per_file = int(data.get("lines_per_file", 0) or 0)
 
     if not input_mask or not output_mask:
-        await message.answer("Сначала отправь маски с помощью команды /start.")
+        await _answer_with_retry(
+            message,
+            "Сначала отправь маски с помощью команды /start.",
+        )
+
         return None
 
 
@@ -592,11 +664,18 @@ async def _convert_file_to_outputs(
     try:
         converted_lines = _convert_lines(text.splitlines(), input_mask, output_mask)
     except ValueError as exc:
-        await message.answer(f"Не удалось преобразовать файл: {exc}")
+        await _answer_with_retry(
+            message,
+            f"Не удалось преобразовать файл: {exc}",
+        )
         return None
 
     if not converted_lines:
-        await message.answer("Не удалось найти строки, подходящие под входную маску.")
+        await _answer_with_retry(
+            message,
+            "Не удалось найти строки, подходящие под входную маску.",
+        )
+
         return None
 
     if lines_per_file > 0:
@@ -609,8 +688,9 @@ async def _convert_file_to_outputs(
 
     if len(chunks) > 1:
         details = f" для {source_name}" if source_name else ""
-        await message.answer(
-            f"Готово! Разбил результат на {len(chunks)} файла(ов){details}."
+        await _answer_with_retry(
+            message,
+            f"Готово! Разбил результат на {len(chunks)} файла(ов){details}.",
         )
 
     stem = _output_stem_from_source(source_name)
@@ -627,7 +707,10 @@ async def _convert_file_to_outputs(
 async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
     document = message.document
     if not document:
-        await message.answer("Пожалуйста, отправь файл как документ (не как фотографию).")
+        await _answer_with_retry(
+            message,
+            "Пожалуйста, отправь файл как документ (не как фотографию).",
+        )
         return
 
     file = await bot.get_file(document.file_id)
@@ -668,21 +751,28 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
         if oversized:
             filename, size = oversized
             size_mb = size / (1024 * 1024)
-            await message.answer(
+            await _answer_with_retry(
+                message,
                 "Не удалось отправить файл "
                 f"{filename}, потому что его размер после конвертации составляет {size_mb:.1f} МБ. "
-                "Попробуй уменьшить размер результата, например, уменьшив число строк в одном файле."
+                "Попробуй уменьшить размер результата, например, уменьшив число строк в одном файле.",
+
             )
             return
 
         if not archives:
-            await message.answer("Не удалось подготовить архив для отправки.")
+            await _answer_with_retry(
+                message,
+                "Не удалось подготовить архив для отправки.",
+            )
             return
 
         if len(archives) > 1:
-            await message.answer(
+            await _answer_with_retry(
+                message,
                 "Итоговый архив получился слишком большим, поэтому разбил результаты на "
-                f"{len(archives)} части."
+                f"{len(archives)} части.",
+
             )
 
         total_parts = len(archives)
@@ -690,8 +780,13 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
             caption = caption_base
             if total_parts > 1:
                 caption = f"{caption_base} Часть {index} из {total_parts}."
+            if index > 1:
+                await asyncio.sleep(1)
             if not await _send_document(message, archive_bytes, archive_name, caption):
                 return
+
+        await _answer_with_retry(message, "Обработка завершена.")
+
 
     await state.clear()
 
@@ -700,8 +795,9 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     match = URL_PATTERN.search(text)
     if not match:
-        await message.answer(
-            "Пожалуйста, отправь документ или ссылку на файл/папку в Google Drive или на Яндекс Диске."
+        await _answer_with_retry(
+            message,
+            "Пожалуйста, отправь документ или ссылку на файл/папку в Google Drive или на Яндекс Диске.",
         )
         return
 
@@ -710,19 +806,26 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
     try:
         files = await _download_files_from_link(url)
     except ValueError as exc:
-        await message.answer(str(exc))
+        await _answer_with_retry(message, str(exc))
         return
     except aiohttp.ClientError:
-        await message.answer("Не удалось скачать файл по ссылке. Попробуй позже или отправь документ.")
+        await _answer_with_retry(
+            message,
+            "Не удалось скачать файл по ссылке. Попробуй позже или отправь документ.",
+        )
         return
 
     if not files:
-        await message.answer("Не удалось найти файлы по указанной ссылке.")
+        await _answer_with_retry(
+            message,
+            "Не удалось найти файлы по указанной ссылке.",
+        )
         return
 
     if len(files) > 1:
-        await message.answer(
-            f"Нашёл {len(files)} файла(ов) по ссылке. Начинаю обработку..."
+        await _answer_with_retry(
+            message,
+            f"Нашёл {len(files)} файла(ов) по ссылке. Начинаю обработку...",
         )
 
     converted_entries: List[Tuple[str, bytes]] = []
@@ -753,7 +856,11 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
     await state.clear()
 
     if not converted_entries:
-        await message.answer("Не удалось подготовить файлы для отправки.")
+        await _answer_with_retry(
+            message,
+            "Не удалось подготовить файлы для отправки.",
+        )
+
         return
 
     if len(converted_entries) == 1 and len(files) == 1:
@@ -781,21 +888,28 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
     if oversized:
         filename, size = oversized
         size_mb = size / (1024 * 1024)
-        await message.answer(
+        await _answer_with_retry(
+            message,
             "Не удалось отправить файл "
             f"{filename}, потому что его размер после конвертации составляет {size_mb:.1f} МБ. "
-            "Попробуй уменьшить размер результата, например, уменьшив число строк в одном файле."
+            "Попробуй уменьшить размер результата, например, уменьшив число строк в одном файле.",
+
         )
         return
 
     if not archives:
-        await message.answer("Не удалось подготовить архив для отправки.")
+        await _answer_with_retry(
+            message,
+            "Не удалось подготовить архив для отправки.",
+        )
         return
 
     if len(archives) > 1:
-        await message.answer(
+        await _answer_with_retry(
+            message,
             "Итоговый архив получился слишком большим, поэтому разбил результаты на "
-            f"{len(archives)} части."
+            f"{len(archives)} части.",
+
         )
 
     total_parts = len(archives)
@@ -803,8 +917,12 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
         caption = caption_base
         if total_parts > 1:
             caption = f"{caption_base} Часть {index} из {total_parts}."
+        if index > 1:
+            await asyncio.sleep(1)
         if not await _send_document(message, archive_bytes, archive_name, caption):
             return
+
+    await _answer_with_retry(message, "Обработка завершена.")
 
 
 
