@@ -3,8 +3,10 @@ import io
 import logging
 import os
 import re
-from typing import Iterable, List
+from typing import Iterable, List, Mapping, Optional, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
@@ -16,6 +18,7 @@ from dotenv import load_dotenv
 
 
 PLACEHOLDER_PATTERN = re.compile(r"\{([a-zA-Z_][\w-]*)\}")
+URL_PATTERN = re.compile(r"https?://\S+")
 
 
 class ConversionStates(StatesGroup):
@@ -74,6 +77,123 @@ def _convert_lines(lines: Iterable[str], input_mask: str, output_mask: str) -> L
         converted.append(output_mask.format_map(values))
 
     return converted
+
+
+def _strip_trailing_punctuation(url: str) -> str:
+    return url.rstrip(".,)>]}\n\r")
+
+
+def _filename_from_headers(headers: Optional[Mapping[str, str]]) -> Optional[str]:
+    content_disposition = headers.get("Content-Disposition") if headers else None
+    if not content_disposition:
+        return None
+
+    match = re.search(r"filename\*=UTF-8''([^;]+)", content_disposition)
+    if match:
+        return unquote(match.group(1))
+
+    match = re.search(r'filename="?([^";]+)"?', content_disposition)
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def _extract_drive_file_id(parsed_url) -> Optional[str]:
+    if parsed_url.path.startswith("/file/d/"):
+        parts = parsed_url.path.split("/")
+        try:
+            file_index = parts.index("d") + 1
+            return parts[file_index]
+        except (ValueError, IndexError):
+            return None
+
+    query = parse_qs(parsed_url.query)
+    for key in ("id", "fid"):
+        if key in query and query[key]:
+            return query[key][0]
+
+    path_parts = parsed_url.path.split("/")
+    if "uc" in path_parts:
+        try:
+            idx = path_parts.index("uc")
+            if idx + 1 < len(path_parts):
+                return path_parts[idx + 1]
+        except ValueError:
+            pass
+
+    return None
+
+
+async def _download_google_drive_file(
+    session: aiohttp.ClientSession, file_id: str
+) -> Tuple[bytes, Optional[str]]:
+    download_url = "https://drive.google.com/uc"
+    params = {"export": "download", "id": file_id}
+
+    async with session.get(download_url, params=params) as response:
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "")
+
+        if "text/html" not in content_type:
+            content = await response.read()
+            filename = _filename_from_headers(response.headers)
+            return content, filename or f"google-drive-{file_id}"
+
+        page = await response.text()
+        token_match = re.search(r"confirm=([0-9A-Za-z_]+)", page)
+        if not token_match:
+            raise ValueError(
+                "Не удалось получить файл из Google Drive. Проверь, что доступ по ссылке открыт."
+            )
+
+        params["confirm"] = token_match.group(1)
+
+    async with session.get(download_url, params=params) as response:
+        response.raise_for_status()
+        content = await response.read()
+        filename = _filename_from_headers(response.headers)
+
+    return content, filename or f"google-drive-{file_id}"
+
+
+async def _download_yandex_disk_file(session: aiohttp.ClientSession, public_key: str) -> Tuple[bytes, Optional[str]]:
+    api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
+
+    async with session.get(api_url, params={"public_key": public_key}) as meta_response:
+        meta_response.raise_for_status()
+        meta = await meta_response.json()
+
+    href = meta.get("href")
+    if not href:
+        raise ValueError("Не удалось получить ссылку для скачивания с Яндекс Диска.")
+
+    async with session.get(href) as file_response:
+        file_response.raise_for_status()
+        content = await file_response.read()
+        filename = _filename_from_headers(file_response.headers)
+
+    return content, filename
+
+
+async def _download_file_from_link(url: str) -> Tuple[bytes, Optional[str]]:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("Похоже, что ссылка имеет неподдерживаемый формат.")
+
+    domain = parsed.netloc.lower()
+
+    async with aiohttp.ClientSession() as session:
+        if "drive.google.com" in domain:
+            file_id = _extract_drive_file_id(parsed)
+            if not file_id:
+                raise ValueError("Не удалось определить идентификатор файла Google Drive.")
+            return await _download_google_drive_file(session, file_id)
+
+        if any(domain.endswith(part) for part in ("yadi.sk", "disk.yandex.ru")):
+            return await _download_yandex_disk_file(session, url)
+
+    raise ValueError("Поддерживаются только ссылки на Google Drive и Яндекс Диск.")
 
 
 async def handle_start(message: Message, state: FSMContext) -> None:
@@ -149,29 +269,18 @@ async def handle_lines_per_file(message: Message, state: FSMContext) -> None:
 
 
 
-async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
+async def _convert_and_send(message: Message, state: FSMContext, file_content: bytes) -> None:
     data = await state.get_data()
     input_mask = data.get("input_mask")
     output_mask = data.get("output_mask")
 
     lines_per_file = int(data.get("lines_per_file", 0) or 0)
 
-
     if not input_mask or not output_mask:
         await message.answer("Сначала отправь маски с помощью команды /start.")
         return
 
-    document = message.document
-    if not document:
-        await message.answer("Пожалуйста, отправь файл как документ (не как фотографию).")
-        return
-
-    file = await bot.get_file(document.file_id)
-    buffer = io.BytesIO()
-    await bot.download_file(file.file_path, buffer)
-    buffer.seek(0)
-
-    text = buffer.read().decode("utf-8", errors="ignore")
+    text = file_content.decode("utf-8", errors="ignore")
     try:
         converted_lines = _convert_lines(text.splitlines(), input_mask, output_mask)
     except ValueError as exc:
@@ -212,6 +321,43 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
 
 
+async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
+    document = message.document
+    if not document:
+        await message.answer("Пожалуйста, отправь файл как документ (не как фотографию).")
+        return
+
+    file = await bot.get_file(document.file_id)
+    buffer = io.BytesIO()
+    await bot.download_file(file.file_path, buffer)
+    buffer.seek(0)
+
+    await _convert_and_send(message, state, buffer.read())
+
+
+async def handle_file_link(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    match = URL_PATTERN.search(text)
+    if not match:
+        await message.answer(
+            "Пожалуйста, отправь документ или ссылку на файл в Google Drive или на Яндекс Диске."
+        )
+        return
+
+    url = _strip_trailing_punctuation(match.group(0))
+
+    try:
+        file_content, _ = await _download_file_from_link(url)
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
+    except aiohttp.ClientError:
+        await message.answer("Не удалось скачать файл по ссылке. Попробуй позже или отправь документ.")
+        return
+
+    await _convert_and_send(message, state, file_content)
+
+
 async def main() -> None:
     load_dotenv()
     token = os.environ.get("BOT_TOKEN")
@@ -226,6 +372,7 @@ async def main() -> None:
     dp.message.register(handle_start, CommandStart())
     dp.message.register(handle_cancel, Command(commands=["cancel"]))
     dp.message.register(handle_file, ConversionStates.waiting_file, F.document)
+    dp.message.register(handle_file_link, ConversionStates.waiting_file, F.text)
 
     dp.message.register(handle_lines_per_file, ConversionStates.lines_per_file, F.text)
 
