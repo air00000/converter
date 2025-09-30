@@ -498,6 +498,25 @@ def _split_lines_to_fit(lines: List[str]) -> List[List[str]]:
     right = _split_lines_to_fit(lines[mid:])
     return left + right
 
+def _split_all_chunks_to_fit(chunks: List[List[str]]) -> List[List[str]]:
+    split_chunks: List[List[str]] = []
+    for chunk in chunks:
+        split_chunks.extend(_split_lines_to_fit(chunk))
+    return split_chunks
+
+
+def _build_files_payload(
+    split_chunks: List[List[str]], stem: str
+) -> List[Tuple[str, bytes]]:
+    total_parts = len(split_chunks)
+    files_with_data: List[Tuple[str, bytes]] = []
+    for idx, chunk in enumerate(split_chunks, start=1):
+        output_bytes = _encode_lines(chunk)
+        filename = _output_filename(stem, idx, total_parts)
+        files_with_data.append((filename, output_bytes))
+    return files_with_data
+
+
 
 def _create_zip_archive(files: List[Tuple[str, bytes]]) -> bytes:
     buffer = io.BytesIO()
@@ -578,7 +597,9 @@ async def _convert_and_send(
 
     text = file_content.decode("utf-8", errors="ignore")
     try:
-        converted_lines = _convert_lines(text.splitlines(), input_mask, output_mask)
+        converted_lines = await asyncio.to_thread(
+            _convert_lines, text.splitlines(), input_mask, output_mask
+        )
     except ValueError as exc:
         await message.answer(f"Не удалось преобразовать файл: {exc}")
         return False
@@ -595,15 +616,14 @@ async def _convert_and_send(
     else:
         chunks = [converted_lines]
 
-    split_chunks: List[List[str]] = []
-    for chunk in chunks:
-        try:
-            split_chunks.extend(_split_lines_to_fit(chunk))
-        except ValueError:
-            await message.answer(
-                "Не удалось подготовить файлы: даже после разбиения они превышают ограничения Telegram."
-            )
-            return False
+    try:
+        split_chunks = await asyncio.to_thread(_split_all_chunks_to_fit, chunks)
+    except ValueError:
+        await message.answer(
+            "Не удалось подготовить файлы: даже после разбиения они превышают ограничения Telegram."
+        )
+        return False
+
 
     total_parts = len(split_chunks)
     if total_parts > 1:
@@ -613,14 +633,11 @@ async def _convert_and_send(
         )
 
     stem = _output_stem_from_source(source_name)
-    files_with_data: List[Tuple[str, bytes]] = []
-    for idx, chunk in enumerate(split_chunks, start=1):
-        output_bytes = _encode_lines(chunk)
-        filename = _output_filename(stem, idx, total_parts)
-        files_with_data.append((filename, output_bytes))
+    files_with_data = await asyncio.to_thread(_build_files_payload, split_chunks, stem)
 
     try:
-        archives = _group_into_archives(files_with_data, stem)
+        archives = await asyncio.to_thread(_group_into_archives, files_with_data, stem)
+
     except ValueError:
         await message.answer(
             "Не удалось сформировать архив в пределах ограничения Telegram. Попробуй уменьшить размер файлов."
