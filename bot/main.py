@@ -510,6 +510,66 @@ def _output_filename(stem: str, part_index: int, total_parts: int) -> str:
     return f"{stem}_part_{part_index}.txt"
 
 
+
+def _zip_entries(entries: Iterable[Tuple[str, bytes]]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for relative_path, output_bytes in entries:
+            zip_file.writestr(relative_path, output_bytes)
+    return buffer.getvalue()
+
+
+def _split_entries_into_archives(
+    entries: List[Tuple[str, bytes]],
+    archive_stem: str,
+) -> Tuple[List[Tuple[str, bytes]], Optional[Tuple[str, int]]]:
+    for relative_path, output_bytes in entries:
+        if len(output_bytes) > MAX_TELEGRAM_FILE_SIZE:
+            return [], (relative_path, len(output_bytes))
+
+    archives: List[Tuple[str, bytes]] = []
+    if not entries:
+        return archives, None
+
+    current_chunk: List[Tuple[str, bytes]] = []
+    current_zip: Optional[bytes] = None
+
+    for relative_path, output_bytes in entries:
+        current_chunk.append((relative_path, output_bytes))
+        current_zip = _zip_entries(current_chunk)
+
+        if len(current_zip) > MAX_TELEGRAM_FILE_SIZE:
+            current_chunk.pop()
+
+            if current_chunk:
+                archives.append(("", _zip_entries(current_chunk)))
+            else:
+                return [], (relative_path, len(output_bytes))
+
+            current_chunk = [(relative_path, output_bytes)]
+            current_zip = _zip_entries(current_chunk)
+
+            if len(current_zip) > MAX_TELEGRAM_FILE_SIZE:
+                return [], (relative_path, len(output_bytes))
+
+    if current_chunk:
+        assert current_zip is not None
+        if len(current_zip) > MAX_TELEGRAM_FILE_SIZE:
+            single_path, single_bytes = current_chunk[0]
+            return [], (single_path, len(single_bytes))
+        archives.append(("", current_zip))
+
+    total_parts = len(archives)
+    named_archives: List[Tuple[str, bytes]] = []
+    for index, (_, archive_bytes) in enumerate(archives, start=1):
+        if total_parts == 1:
+            archive_name = f"{archive_stem}.zip"
+        else:
+            archive_name = f"{archive_stem}_part_{index}.zip"
+        named_archives.append((archive_name, archive_bytes))
+
+    return named_archives, None
+
 async def _convert_file_to_outputs(
     message: Message,
     state: FSMContext,
@@ -595,26 +655,43 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
             else "Готово! Вот преобразованный файл."
         )
         if not await _send_document(message, output_bytes, filename, caption):
-
             return
     else:
-        archive_name = f"{stem}.zip"
-        archive_buffer = io.BytesIO()
-        with zipfile.ZipFile(archive_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-            for filename, output_bytes in outputs:
-                zip_file.writestr(filename, output_bytes)
-        archive_buffer.seek(0)
+        caption_base = (
 
-        caption = (
             f"Готово! Вот архив с результатами для {document.file_name}."
             if document.file_name
             else "Готово! Вот архив с результатами."
         )
 
-        archive_bytes = archive_buffer.getvalue()
-        if not await _send_document(message, archive_bytes, archive_name, caption):
-
+        archives, oversized = _split_entries_into_archives(outputs, stem)
+        if oversized:
+            filename, size = oversized
+            size_mb = size / (1024 * 1024)
+            await message.answer(
+                "Не удалось отправить файл "
+                f"{filename}, потому что его размер после конвертации составляет {size_mb:.1f} МБ. "
+                "Попробуй уменьшить размер результата, например, уменьшив число строк в одном файле."
+            )
             return
+
+        if not archives:
+            await message.answer("Не удалось подготовить архив для отправки.")
+            return
+
+        if len(archives) > 1:
+            await message.answer(
+                "Итоговый архив получился слишком большим, поэтому разбил результаты на "
+                f"{len(archives)} части."
+            )
+
+        total_parts = len(archives)
+        for index, (archive_name, archive_bytes) in enumerate(archives, start=1):
+            caption = caption_base
+            if total_parts > 1:
+                caption = f"{caption_base} Часть {index} из {total_parts}."
+            if not await _send_document(message, archive_bytes, archive_name, caption):
+                return
 
     await state.clear()
 
@@ -688,34 +765,47 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
         )
 
         await _send_document(message, output_bytes, filename, caption)
-
         return
 
-    archive_buffer = io.BytesIO()
-    with zipfile.ZipFile(archive_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for relative_path, output_bytes in converted_entries:
-            zip_file.writestr(relative_path, output_bytes)
-    archive_buffer.seek(0)
+    archive_stem = "converted_files" if len(files) > 1 else (archive_stem or "converted")
 
+    caption_base = "Готово! Вот архив с результатами."
     if len(files) > 1:
-        archive_name = "converted_files.zip"
-    else:
-        archive_name = f"{(archive_stem or 'converted')}.zip"
-
-    caption = "Готово! Вот архив с результатами."
-    if len(files) > 1:
-        caption = (
+        caption_base = (
             "Готово! Обработал все доступные файлы по ссылке. Вот архив с результатами."
         )
     elif single_source_name:
-        caption = f"Готово! Вот архив с результатами для {single_source_name}."
+        caption_base = f"Готово! Вот архив с результатами для {single_source_name}."
 
-    await _send_document(
-        message,
-        archive_buffer.getvalue(),
-        archive_name,
-        caption,
-    )
+    archives, oversized = _split_entries_into_archives(converted_entries, archive_stem)
+    if oversized:
+        filename, size = oversized
+        size_mb = size / (1024 * 1024)
+        await message.answer(
+            "Не удалось отправить файл "
+            f"{filename}, потому что его размер после конвертации составляет {size_mb:.1f} МБ. "
+            "Попробуй уменьшить размер результата, например, уменьшив число строк в одном файле."
+        )
+        return
+
+    if not archives:
+        await message.answer("Не удалось подготовить архив для отправки.")
+        return
+
+    if len(archives) > 1:
+        await message.answer(
+            "Итоговый архив получился слишком большим, поэтому разбил результаты на "
+            f"{len(archives)} части."
+        )
+
+    total_parts = len(archives)
+    for index, (archive_name, archive_bytes) in enumerate(archives, start=1):
+        caption = caption_base
+        if total_parts > 1:
+            caption = f"{caption_base} Часть {index} из {total_parts}."
+        if not await _send_document(message, archive_bytes, archive_name, caption):
+            return
+
 
 
     try:
