@@ -498,7 +498,6 @@ def _split_lines_to_fit(lines: List[str]) -> List[List[str]]:
     right = _split_lines_to_fit(lines[mid:])
     return left + right
 
-
 def _split_all_chunks_to_fit(chunks: List[List[str]]) -> List[List[str]]:
     split_chunks: List[List[str]] = []
     for chunk in chunks:
@@ -516,6 +515,7 @@ def _build_files_payload(
         filename = _output_filename(stem, idx, total_parts)
         files_with_data.append((filename, output_bytes))
     return files_with_data
+
 
 
 def _create_zip_archive(files: List[Tuple[str, bytes]]) -> bytes:
@@ -624,6 +624,7 @@ async def _convert_and_send(
         )
         return False
 
+
     total_parts = len(split_chunks)
     if total_parts > 1:
         details = f" для {source_name}" if source_name else ""
@@ -636,6 +637,7 @@ async def _convert_and_send(
 
     try:
         archives = await asyncio.to_thread(_group_into_archives, files_with_data, stem)
+
     except ValueError:
         await message.answer(
             "Не удалось сформировать архив в пределах ограничения Telegram. Попробуй уменьшить размер файлов."
