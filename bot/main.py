@@ -110,6 +110,7 @@ async def _answer_with_retry(message: Message, text: str, **kwargs: Any) -> None
 
     logging.warning("Failed to send message '%s' after retries", text)
 
+
 class ConversionStates(StatesGroup):
     input_mask = State()
     output_mask = State()
@@ -259,18 +260,42 @@ async def _download_google_drive_file(
 
 
 
-async def _download_google_drive_folder(folder_id: str) -> List[Tuple[bytes, Optional[str]]]:
+async def _download_google_drive_folder(
+    folder_id: str, source_url: Optional[str] = None
+) -> List[Tuple[bytes, Optional[str]]]:
     loop = asyncio.get_running_loop()
 
     with tempfile.TemporaryDirectory() as tmpdir:
 
         def _download_folder() -> List[str]:
-            return gdown.download_folder(
-                id=folder_id,
-                output=tmpdir,
-                quiet=True,
-                use_cookies=False,
-            ) or []
+            attempts: List[Mapping[str, Any]] = [{"id": folder_id}]
+            if source_url:
+                attempts.append({"url": source_url})
+
+            last_error: Optional[Exception] = None
+
+            for params in attempts:
+                try:
+                    result = gdown.download_folder(
+                        output=tmpdir,
+                        quiet=True,
+                        use_cookies=True,
+                        remaining_ok=True,
+                        **params,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    continue
+
+                if result:
+                    return result
+
+                last_error = last_error or RuntimeError("empty response")
+
+            if last_error:
+                raise last_error
+
+            return []
 
         try:
             downloaded_paths = await loop.run_in_executor(None, _download_folder)
@@ -427,7 +452,7 @@ async def _download_files_from_link(url: str) -> List[Tuple[bytes, Optional[str]
     if "drive.google.com" in domain:
         folder_id = _extract_drive_folder_id(parsed)
         if folder_id:
-            return await _download_google_drive_folder(folder_id)
+            return await _download_google_drive_folder(folder_id, url)
 
     async with aiohttp.ClientSession() as session:
         if "drive.google.com" in domain:
@@ -441,11 +466,11 @@ async def _download_files_from_link(url: str) -> List[Tuple[bytes, Optional[str]
                     return [(content, filename)]
                 except ValueError:
                     if folder_id_fallback and folder_id_fallback == file_id:
-                        return await _download_google_drive_folder(folder_id_fallback)
+                        return await _download_google_drive_folder(folder_id_fallback, url)
                     raise
 
             if folder_id_fallback:
-                return await _download_google_drive_folder(folder_id_fallback)
+                return await _download_google_drive_folder(folder_id_fallback, url)
 
             raise ValueError("Не удалось определить идентификатор файла Google Drive.")
 
@@ -632,9 +657,68 @@ def _split_entries_into_archives(
         else:
             archive_name = f"{archive_stem}_part_{index}.zip"
         named_archives.append((archive_name, archive_bytes))
+        
+def _zip_entries(entries: Iterable[Tuple[str, bytes]]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for relative_path, output_bytes in entries:
+            zip_file.writestr(relative_path, output_bytes)
+    return buffer.getvalue()
+
+
+def _split_entries_into_archives(
+    entries: List[Tuple[str, bytes]],
+    archive_stem: str,
+) -> Tuple[List[Tuple[str, bytes]], Optional[Tuple[str, int]]]:
+    for relative_path, output_bytes in entries:
+        if len(output_bytes) > MAX_TELEGRAM_FILE_SIZE:
+            return [], (relative_path, len(output_bytes))
+
+    archives: List[Tuple[str, bytes]] = []
+    if not entries:
+        return archives, None
+
+    current_chunk: List[Tuple[str, bytes]] = []
+    current_zip: Optional[bytes] = None
+
+    for relative_path, output_bytes in entries:
+        current_chunk.append((relative_path, output_bytes))
+        current_zip = _zip_entries(current_chunk)
+
+        if len(current_zip) > MAX_TELEGRAM_FILE_SIZE:
+            current_chunk.pop()
+
+            if current_chunk:
+                archives.append(("", _zip_entries(current_chunk)))
+            else:
+                return [], (relative_path, len(output_bytes))
+
+            current_chunk = [(relative_path, output_bytes)]
+            current_zip = _zip_entries(current_chunk)
+
+            if len(current_zip) > MAX_TELEGRAM_FILE_SIZE:
+                return [], (relative_path, len(output_bytes))
+
+    if current_chunk:
+        assert current_zip is not None
+        if len(current_zip) > MAX_TELEGRAM_FILE_SIZE:
+            single_path, single_bytes = current_chunk[0]
+            return [], (single_path, len(single_bytes))
+        archives.append(("", current_zip))
+
+    total_parts = len(archives)
+    named_archives: List[Tuple[str, bytes]] = []
+    for index, (_, archive_bytes) in enumerate(archives, start=1):
+        if total_parts == 1:
+            archive_name = f"{archive_stem}.zip"
+        else:
+            archive_name = f"{archive_stem}_part_{index}.zip"
+        named_archives.append((archive_name, archive_bytes))
 
     return named_archives, None
-  
+
+
+
 async def _convert_file_to_outputs(
     message: Message,
     state: FSMContext,
@@ -906,8 +990,20 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
             message,
             "Итоговый архив получился слишком большим, поэтому разбил результаты на "
             f"{len(archives)} части.",
-
         )
+
+    total_parts = len(archives)
+    for index, (archive_name, archive_bytes) in enumerate(archives, start=1):
+        caption = caption_base
+        if total_parts > 1:
+            caption = f"{caption_base} Часть {index} из {total_parts}."
+        if index > 1:
+            await asyncio.sleep(1)
+        if not await _send_document(message, archive_bytes, archive_name, caption):
+            return
+
+    await _answer_with_retry(message, "Обработка завершена.")
+
 
     total_parts = len(archives)
     for index, (archive_name, archive_bytes) in enumerate(archives, start=1):
