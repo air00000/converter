@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 import gdown
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
@@ -128,6 +129,7 @@ def _extract_drive_file_id(parsed_url) -> Optional[str]:
     return None
 
 
+
 def _extract_drive_folder_id(parsed_url) -> Optional[str]:
     parts = [part for part in parsed_url.path.split("/") if part]
     if "folders" in parts:
@@ -136,6 +138,7 @@ def _extract_drive_folder_id(parsed_url) -> Optional[str]:
             return parts[idx + 1]
 
     return None
+
 
 
 async def _download_google_drive_file(
@@ -168,6 +171,7 @@ async def _download_google_drive_file(
         filename = _filename_from_headers(response.headers)
 
     return content, filename or f"google-drive-{file_id}"
+
 
 
 async def _download_google_drive_folder(folder_id: str) -> List[Tuple[bytes, Optional[str]]]:
@@ -235,7 +239,9 @@ async def _download_yandex_disk_file(
         content = await file_response.read()
         filename = _filename_from_headers(file_response.headers) or suggested_name
 
+
     return content, filename
+
 
 
 async def _fetch_yandex_resource_meta(
@@ -332,6 +338,7 @@ async def _download_files_from_link(url: str) -> List[Tuple[bytes, Optional[str]
 
     domain = parsed.netloc.lower()
 
+
     if "drive.google.com" in domain:
         folder_id = _extract_drive_folder_id(parsed)
         if folder_id:
@@ -371,6 +378,7 @@ async def _download_files_from_link(url: str) -> List[Tuple[bytes, Optional[str]
                 return await _download_yandex_disk_folder(session, url, root_meta)
 
             raise ValueError("Не удалось определить тип ресурса Яндекс Диска по ссылке.")
+
 
     raise ValueError("Поддерживаются только ссылки на Google Drive и Яндекс Диск.")
 
@@ -451,6 +459,7 @@ async def handle_lines_per_file(message: Message, state: FSMContext) -> None:
 
 
 
+
 def _output_stem_from_source(source_name: Optional[str]) -> str:
     if not source_name:
         return "converted"
@@ -473,6 +482,7 @@ async def _convert_and_send(
     file_content: bytes,
     source_name: Optional[str] = None,
 ) -> bool:
+
     data = await state.get_data()
     input_mask = data.get("input_mask")
     output_mask = data.get("output_mask")
@@ -482,6 +492,7 @@ async def _convert_and_send(
     if not input_mask or not output_mask:
         await message.answer("Сначала отправь маски с помощью команды /start.")
         return False
+
 
     text = file_content.decode("utf-8", errors="ignore")
     try:
@@ -595,6 +606,43 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
         await state.clear()
         if len(files) > 1:
             await message.answer("Готово! Обработал все доступные файлы по ссылке.")
+
+
+async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
+    document = message.document
+    if not document:
+        await message.answer("Пожалуйста, отправь файл как документ (не как фотографию).")
+        return
+
+    file = await bot.get_file(document.file_id)
+    buffer = io.BytesIO()
+    await bot.download_file(file.file_path, buffer)
+    buffer.seek(0)
+
+    await _convert_and_send(message, state, buffer.read())
+
+
+async def handle_file_link(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    match = URL_PATTERN.search(text)
+    if not match:
+        await message.answer(
+            "Пожалуйста, отправь документ или ссылку на файл в Google Drive или на Яндекс Диске."
+        )
+        return
+
+    url = _strip_trailing_punctuation(match.group(0))
+
+    try:
+        file_content, _ = await _download_file_from_link(url)
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
+    except aiohttp.ClientError:
+        await message.answer("Не удалось скачать файл по ссылке. Попробуй позже или отправь документ.")
+        return
+
+    await _convert_and_send(message, state, file_content)
 
 
 async def main() -> None:
