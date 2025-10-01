@@ -4,14 +4,13 @@ import logging
 import os
 import re
 import tempfile
-import zipfile
 from pathlib import Path
 from typing import Any, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
+
 import aiohttp
 import gdown
-
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -28,87 +27,6 @@ MAX_TELEGRAM_FILE_SIZE = 49 * 1024 * 1024
 PLACEHOLDER_PATTERN = re.compile(r"\{([a-zA-Z_][\w-]*)\}")
 URL_PATTERN = re.compile(r"https?://\S+")
 
-
-async def _send_document(
-    message: Message,
-    file_bytes: bytes,
-    filename: str,
-    caption: str,
-) -> bool:
-    size = len(file_bytes)
-    if size > MAX_TELEGRAM_FILE_SIZE:
-        size_mb = size / (1024 * 1024)
-        await _answer_with_retry(
-            message,
-            (
-                "Не удалось отправить файл, потому что его размер превышает ограничение Telegram "
-                f"({size_mb:.1f} МБ). Попробуй уменьшить размер файла или разбить результат на части."
-            ),
-        )
-        return False
-
-    retries_left = 3
-    while retries_left > 0:
-        try:
-            await message.answer_document(
-                BufferedInputFile(file_bytes, filename=filename),
-                caption=caption,
-            )
-            return True
-        except TelegramRetryAfter as exc:
-            retries_left -= 1
-            await asyncio.sleep(exc.retry_after + 1)
-        except TelegramBadRequest as exc:
-            retry_after = _extract_retry_after_seconds(str(exc))
-            if retry_after is not None and retries_left > 1:
-                retries_left -= 1
-                await asyncio.sleep(retry_after + 1)
-                continue
-            logging.exception("Failed to send document %s", filename, exc_info=exc)
-            break
-        except (aiohttp.ClientError, ConnectionError) as exc:
-            logging.exception("Failed to send document %s", filename, exc_info=exc)
-            break
-
-    await _answer_with_retry(
-        message,
-        "Не удалось отправить файл из-за проблемы с соединением. Попробуй ещё раз чуть позже.",
-    )
-    return False
-
-
-def _extract_retry_after_seconds(message: str) -> Optional[int]:
-    match = re.search(r"retry after (?P<seconds>\d+)", message, re.IGNORECASE)
-    if match:
-        try:
-            return int(match.group("seconds"))
-        except ValueError:
-            return None
-    return None
-
-
-async def _answer_with_retry(message: Message, text: str, **kwargs: Any) -> None:
-    retries_left = 3
-    while retries_left > 0:
-        try:
-            await message.answer(text, **kwargs)
-            return
-        except TelegramRetryAfter as exc:
-            retries_left -= 1
-            await asyncio.sleep(exc.retry_after + 1)
-        except TelegramBadRequest as exc:
-            retry_after = _extract_retry_after_seconds(str(exc))
-            if retry_after is not None and retries_left > 1:
-                retries_left -= 1
-                await asyncio.sleep(retry_after + 1)
-                continue
-            logging.exception("Failed to send message '%s'", text, exc_info=exc)
-            return
-        except (aiohttp.ClientError, ConnectionError) as exc:
-            logging.exception("Failed to send message '%s'", text, exc_info=exc)
-            return
-
-    logging.warning("Failed to send message '%s' after retries", text)
 
 
 class ConversionStates(StatesGroup):
@@ -214,8 +132,6 @@ def _extract_drive_file_id(parsed_url) -> Optional[str]:
 
     return None
 
-
-
 def _extract_drive_folder_id(parsed_url) -> Optional[str]:
     parts = [part for part in parsed_url.path.split("/") if part]
     if "folders" in parts:
@@ -224,7 +140,6 @@ def _extract_drive_folder_id(parsed_url) -> Optional[str]:
             return parts[idx + 1]
 
     return None
-
 
 
 async def _download_google_drive_file(
@@ -259,43 +174,21 @@ async def _download_google_drive_file(
     return content, filename or f"google-drive-{file_id}"
 
 
+async def _download_google_drive_folder(folder_id: str) -> List[Tuple[bytes, Optional[str]]]:
 
-async def _download_google_drive_folder(
-    folder_id: str, source_url: Optional[str] = None
-) -> List[Tuple[bytes, Optional[str]]]:
     loop = asyncio.get_running_loop()
 
     with tempfile.TemporaryDirectory() as tmpdir:
 
         def _download_folder() -> List[str]:
-            attempts: List[Mapping[str, Any]] = [{"id": folder_id}]
-            if source_url:
-                attempts.append({"url": source_url})
 
-            last_error: Optional[Exception] = None
+            return gdown.download_folder(
+                id=folder_id,
+                output=tmpdir,
+                quiet=True,
+                use_cookies=False,
+            ) or []
 
-            for params in attempts:
-                try:
-                    result = gdown.download_folder(
-                        output=tmpdir,
-                        quiet=True,
-                        use_cookies=True,
-                        remaining_ok=True,
-                        **params,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    last_error = exc
-                    continue
-
-                if result:
-                    return result
-
-                last_error = last_error or RuntimeError("empty response")
-
-            if last_error:
-                raise last_error
-
-            return []
 
         try:
             downloaded_paths = await loop.run_in_executor(None, _download_folder)
@@ -452,7 +345,8 @@ async def _download_files_from_link(url: str) -> List[Tuple[bytes, Optional[str]
     if "drive.google.com" in domain:
         folder_id = _extract_drive_folder_id(parsed)
         if folder_id:
-            return await _download_google_drive_folder(folder_id, url)
+            return await _download_google_drive_folder(folder_id)
+
 
     async with aiohttp.ClientSession() as session:
         if "drive.google.com" in domain:
@@ -466,11 +360,13 @@ async def _download_files_from_link(url: str) -> List[Tuple[bytes, Optional[str]
                     return [(content, filename)]
                 except ValueError:
                     if folder_id_fallback and folder_id_fallback == file_id:
-                        return await _download_google_drive_folder(folder_id_fallback, url)
+
+                        return await _download_google_drive_folder(folder_id_fallback)
                     raise
 
             if folder_id_fallback:
-                return await _download_google_drive_folder(folder_id_fallback, url)
+                return await _download_google_drive_folder(folder_id_fallback)
+
 
             raise ValueError("Не удалось определить идентификатор файла Google Drive.")
 
@@ -491,6 +387,15 @@ async def _download_files_from_link(url: str) -> List[Tuple[bytes, Optional[str]
 
 
     raise ValueError("Поддерживаются только ссылки на Google Drive и Яндекс Диск.")
+
+
+async def _download_file_from_link(url: str) -> Tuple[bytes, Optional[str]]:
+    files = await _download_files_from_link(url)
+    if not files:
+        raise ValueError("Не удалось найти файлы по указанной ссылке.")
+
+    return files[0]
+
 
 
 async def handle_start(message: Message, state: FSMContext) -> None:
@@ -577,10 +482,10 @@ async def handle_lines_per_file(message: Message, state: FSMContext) -> None:
 
     await state.update_data(lines_per_file=lines_per_file)
     await state.set_state(ConversionStates.waiting_file)
-    await _answer_with_retry(
-        message,
+
+    await message.answer(
         "Отлично! Теперь пришли файл в виде документа или ссылку на файл/папку. "
-        "Я верну его в нужном формате.",
+        "Я верну его в нужном формате."
     )
 
 
@@ -601,130 +506,16 @@ def _output_filename(stem: str, part_index: int, total_parts: int) -> str:
         return f"{stem}.txt"
     return f"{stem}_part_{part_index}.txt"
 
-def _zip_entries(entries: Iterable[Tuple[str, bytes]]) -> bytes:
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for relative_path, output_bytes in entries:
-            zip_file.writestr(relative_path, output_bytes)
-    return buffer.getvalue()
 
 
-def _split_entries_into_archives(
-    entries: List[Tuple[str, bytes]],
-    archive_stem: str,
-) -> Tuple[List[Tuple[str, bytes]], Optional[Tuple[str, int]]]:
-    for relative_path, output_bytes in entries:
-        if len(output_bytes) > MAX_TELEGRAM_FILE_SIZE:
-            return [], (relative_path, len(output_bytes))
+async def _convert_and_send(
 
-    archives: List[Tuple[str, bytes]] = []
-    if not entries:
-        return archives, None
-
-    current_chunk: List[Tuple[str, bytes]] = []
-    current_zip: Optional[bytes] = None
-
-    for relative_path, output_bytes in entries:
-        current_chunk.append((relative_path, output_bytes))
-        current_zip = _zip_entries(current_chunk)
-
-        if len(current_zip) > MAX_TELEGRAM_FILE_SIZE:
-            current_chunk.pop()
-
-            if current_chunk:
-                archives.append(("", _zip_entries(current_chunk)))
-            else:
-                return [], (relative_path, len(output_bytes))
-
-            current_chunk = [(relative_path, output_bytes)]
-            current_zip = _zip_entries(current_chunk)
-
-            if len(current_zip) > MAX_TELEGRAM_FILE_SIZE:
-                return [], (relative_path, len(output_bytes))
-
-    if current_chunk:
-        assert current_zip is not None
-        if len(current_zip) > MAX_TELEGRAM_FILE_SIZE:
-            single_path, single_bytes = current_chunk[0]
-            return [], (single_path, len(single_bytes))
-        archives.append(("", current_zip))
-
-    total_parts = len(archives)
-    named_archives: List[Tuple[str, bytes]] = []
-    for index, (_, archive_bytes) in enumerate(archives, start=1):
-        if total_parts == 1:
-            archive_name = f"{archive_stem}.zip"
-        else:
-            archive_name = f"{archive_stem}_part_{index}.zip"
-        named_archives.append((archive_name, archive_bytes))
-        
-def _zip_entries(entries: Iterable[Tuple[str, bytes]]) -> bytes:
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for relative_path, output_bytes in entries:
-            zip_file.writestr(relative_path, output_bytes)
-    return buffer.getvalue()
-
-
-def _split_entries_into_archives(
-    entries: List[Tuple[str, bytes]],
-    archive_stem: str,
-) -> Tuple[List[Tuple[str, bytes]], Optional[Tuple[str, int]]]:
-    for relative_path, output_bytes in entries:
-        if len(output_bytes) > MAX_TELEGRAM_FILE_SIZE:
-            return [], (relative_path, len(output_bytes))
-
-    archives: List[Tuple[str, bytes]] = []
-    if not entries:
-        return archives, None
-
-    current_chunk: List[Tuple[str, bytes]] = []
-    current_zip: Optional[bytes] = None
-
-    for relative_path, output_bytes in entries:
-        current_chunk.append((relative_path, output_bytes))
-        current_zip = _zip_entries(current_chunk)
-
-        if len(current_zip) > MAX_TELEGRAM_FILE_SIZE:
-            current_chunk.pop()
-
-            if current_chunk:
-                archives.append(("", _zip_entries(current_chunk)))
-            else:
-                return [], (relative_path, len(output_bytes))
-
-            current_chunk = [(relative_path, output_bytes)]
-            current_zip = _zip_entries(current_chunk)
-
-            if len(current_zip) > MAX_TELEGRAM_FILE_SIZE:
-                return [], (relative_path, len(output_bytes))
-
-    if current_chunk:
-        assert current_zip is not None
-        if len(current_zip) > MAX_TELEGRAM_FILE_SIZE:
-            single_path, single_bytes = current_chunk[0]
-            return [], (single_path, len(single_bytes))
-        archives.append(("", current_zip))
-
-    total_parts = len(archives)
-    named_archives: List[Tuple[str, bytes]] = []
-    for index, (_, archive_bytes) in enumerate(archives, start=1):
-        if total_parts == 1:
-            archive_name = f"{archive_stem}.zip"
-        else:
-            archive_name = f"{archive_stem}_part_{index}.zip"
-        named_archives.append((archive_name, archive_bytes))
-
-    return named_archives, None
-
-
-
-async def _convert_file_to_outputs(
     message: Message,
     state: FSMContext,
     file_content: bytes,
     source_name: Optional[str] = None,
-) -> Optional[Tuple[str, List[Tuple[str, bytes]]]]:
+
+) -> bool:
 
     data = await state.get_data()
     input_mask = data.get("input_mask")
@@ -733,31 +524,23 @@ async def _convert_file_to_outputs(
     lines_per_file = int(data.get("lines_per_file", 0) or 0)
 
     if not input_mask or not output_mask:
-        await _answer_with_retry(
-            message,
-            "Сначала отправь маски с помощью команды /start.",
-        )
 
-        return None
+        await message.answer("Сначала отправь маски с помощью команды /start.")
+        return False
 
 
     text = file_content.decode("utf-8", errors="ignore")
     try:
         converted_lines = _convert_lines(text.splitlines(), input_mask, output_mask)
     except ValueError as exc:
-        await _answer_with_retry(
-            message,
-            f"Не удалось преобразовать файл: {exc}",
-        )
-        return None
+
+        await message.answer(f"Не удалось преобразовать файл: {exc}")
+        return False
 
     if not converted_lines:
-        await _answer_with_retry(
-            message,
-            "Не удалось найти строки, подходящие под входную маску.",
-        )
+        await message.answer("Не удалось найти строки, подходящие под входную маску.")
+        return False
 
-        return None
 
     if lines_per_file > 0:
         chunks = [
@@ -769,29 +552,44 @@ async def _convert_file_to_outputs(
 
     if len(chunks) > 1:
         details = f" для {source_name}" if source_name else ""
-        await _answer_with_retry(
-            message,
-            f"Готово! Разбил результат на {len(chunks)} файла(ов){details}.",
+
+        await message.answer(
+            f"Готово! Разбил результат на {len(chunks)} файла(ов){details}."
         )
 
-    stem = _output_stem_from_source(source_name)
-    outputs: List[Tuple[str, bytes]] = []
 
+    stem = _output_stem_from_source(source_name)
     for idx, chunk in enumerate(chunks, start=1):
         output_bytes = "\n".join(chunk).encode("utf-8")
         filename = _output_filename(stem, idx, len(chunks))
-        outputs.append((filename, output_bytes))
+        output_file = BufferedInputFile(output_bytes, filename=filename)
 
-    return stem, outputs
+        caption: Optional[str]
+        if len(chunks) == 1:
+            caption = (
+                f"Готово! Вот преобразованный файл для {source_name}."
+                if source_name
+                else "Готово! Вот преобразованный файл."
+            )
+        else:
+            caption = None
+
+        try:
+            await message.answer_document(output_file, caption=caption)
+        except TelegramBadRequest:
+            await message.answer(
+                "Не удалось отправить файл. Попробуй файл меньшего размера."
+            )
+            return False
+
+    return True
+
 
 
 async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
     document = message.document
     if not document:
-        await _answer_with_retry(
-            message,
-            "Пожалуйста, отправь файл как документ (не как фотографию).",
-        )
+        await message.answer("Пожалуйста, отправь файл как документ (не как фотографию).")
         return
 
     file = await bot.get_file(document.file_id)
@@ -799,77 +597,55 @@ async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
     await bot.download_file(file.file_path, buffer)
     buffer.seek(0)
 
-    result = await _convert_file_to_outputs(
+    success = await _convert_and_send(
         message,
         state,
         buffer.read(),
         source_name=document.file_name,
     )
 
-    if not result:
+    if success:
+        await state.clear()
+
+
+async def handle_file_link(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    match = URL_PATTERN.search(text)
+    if not match:
+        await message.answer(
+            "Пожалуйста, отправь документ или ссылку на файл/папку в Google Drive или на Яндекс Диске."
+        )
         return
 
-    stem, outputs = result
+    url = _strip_trailing_punctuation(match.group(0))
 
-    if len(outputs) == 1:
-        filename, output_bytes = outputs[0]
-        caption = (
-            f"Готово! Вот преобразованный файл для {document.file_name}."
-            if document.file_name
-            else "Готово! Вот преобразованный файл."
+    try:
+        files = await _download_files_from_link(url)
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
+    except aiohttp.ClientError:
+        await message.answer("Не удалось скачать файл по ссылке. Попробуй позже или отправь документ.")
+        return
+
+    if not files:
+        await message.answer("Не удалось найти файлы по указанной ссылке.")
+        return
+
+    if len(files) > 1:
+        await message.answer(
+            f"Нашёл {len(files)} файла(ов) по ссылке. Начинаю обработку..."
         )
-        if not await _send_document(message, output_bytes, filename, caption):
-            return
-    else:
-        caption_base = (
 
-            f"Готово! Вот архив с результатами для {document.file_name}."
-            if document.file_name
-            else "Готово! Вот архив с результатами."
-        )
+    success_any = False
+    for content, name in sorted(files, key=lambda item: item[1] or ""):
+        success = await _convert_and_send(message, state, content, source_name=name)
+        success_any = success_any or success
 
-        archives, oversized = _split_entries_into_archives(outputs, stem)
-        if oversized:
-            filename, size = oversized
-            size_mb = size / (1024 * 1024)
-            await _answer_with_retry(
-                message,
-                "Не удалось отправить файл "
-                f"{filename}, потому что его размер после конвертации составляет {size_mb:.1f} МБ. "
-                "Попробуй уменьшить размер результата, например, уменьшив число строк в одном файле.",
-
-            )
-            return
-
-        if not archives:
-            await _answer_with_retry(
-                message,
-                "Не удалось подготовить архив для отправки.",
-            )
-            return
-
-        if len(archives) > 1:
-            await _answer_with_retry(
-                message,
-                "Итоговый архив получился слишком большим, поэтому разбил результаты на "
-                f"{len(archives)} части.",
-
-            )
-
-        total_parts = len(archives)
-        for index, (archive_name, archive_bytes) in enumerate(archives, start=1):
-            caption = caption_base
-            if total_parts > 1:
-                caption = f"{caption_base} Часть {index} из {total_parts}."
-            if index > 1:
-                await asyncio.sleep(1)
-            if not await _send_document(message, archive_bytes, archive_name, caption):
-                return
-
-        await _answer_with_retry(message, "Обработка завершена.")
-
-
-    await state.clear()
+    if success_any:
+        await state.clear()
+        if len(files) > 1:
+            await message.answer("Готово! Обработал все доступные файлы по ссылке.")
 
 
 async def handle_file_link(message: Message, state: FSMContext) -> None:
