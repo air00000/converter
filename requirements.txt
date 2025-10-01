@@ -1,4 +1,5 @@
-aiohttp==3.9.5
-aiogram==3.4.1
+aiogram==3.12.0
+aiohttp==3.10.8
+aiofiles==24.1.0
 python-dotenv==1.0.1
-gdown==4.7.1
+gdown==5.2.0
