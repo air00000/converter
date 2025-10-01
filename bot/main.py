@@ -8,11 +8,13 @@ from pathlib import Path
 from typing import Any, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
+
 import aiohttp
 import gdown
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -20,8 +22,11 @@ from aiogram.types import BufferedInputFile, Message
 from dotenv import load_dotenv
 
 
+MAX_TELEGRAM_FILE_SIZE = 49 * 1024 * 1024
+
 PLACEHOLDER_PATTERN = re.compile(r"\{([a-zA-Z_][\w-]*)\}")
 URL_PATTERN = re.compile(r"https?://\S+")
+
 
 
 class ConversionStates(StatesGroup):
@@ -127,7 +132,6 @@ def _extract_drive_file_id(parsed_url) -> Optional[str]:
 
     return None
 
-
 def _extract_drive_folder_id(parsed_url) -> Optional[str]:
     parts = [part for part in parsed_url.path.split("/") if part]
     if "folders" in parts:
@@ -171,17 +175,20 @@ async def _download_google_drive_file(
 
 
 async def _download_google_drive_folder(folder_id: str) -> List[Tuple[bytes, Optional[str]]]:
+
     loop = asyncio.get_running_loop()
 
     with tempfile.TemporaryDirectory() as tmpdir:
 
         def _download_folder() -> List[str]:
+
             return gdown.download_folder(
                 id=folder_id,
                 output=tmpdir,
                 quiet=True,
                 use_cookies=False,
             ) or []
+
 
         try:
             downloaded_paths = await loop.run_in_executor(None, _download_folder)
@@ -235,7 +242,9 @@ async def _download_yandex_disk_file(
         content = await file_response.read()
         filename = _filename_from_headers(file_response.headers) or suggested_name
 
+
     return content, filename
+
 
 
 async def _fetch_yandex_resource_meta(
@@ -332,10 +341,12 @@ async def _download_files_from_link(url: str) -> List[Tuple[bytes, Optional[str]
 
     domain = parsed.netloc.lower()
 
+
     if "drive.google.com" in domain:
         folder_id = _extract_drive_folder_id(parsed)
         if folder_id:
             return await _download_google_drive_folder(folder_id)
+
 
     async with aiohttp.ClientSession() as session:
         if "drive.google.com" in domain:
@@ -349,11 +360,13 @@ async def _download_files_from_link(url: str) -> List[Tuple[bytes, Optional[str]
                     return [(content, filename)]
                 except ValueError:
                     if folder_id_fallback and folder_id_fallback == file_id:
+
                         return await _download_google_drive_folder(folder_id_fallback)
                     raise
 
             if folder_id_fallback:
                 return await _download_google_drive_folder(folder_id_fallback)
+
 
             raise ValueError("Не удалось определить идентификатор файла Google Drive.")
 
@@ -372,6 +385,7 @@ async def _download_files_from_link(url: str) -> List[Tuple[bytes, Optional[str]
 
             raise ValueError("Не удалось определить тип ресурса Яндекс Диска по ссылке.")
 
+
     raise ValueError("Поддерживаются только ссылки на Google Drive и Яндекс Диск.")
 
 
@@ -383,9 +397,11 @@ async def _download_file_from_link(url: str) -> Tuple[bytes, Optional[str]]:
     return files[0]
 
 
+
 async def handle_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(
+    await _answer_with_retry(
+        message,
         "👋 Привет! Отправь мне маску текущей структуры строк файла.\n"
         "Используй плейсхолдеры в фигурных скобках, например:\n"
         "`{protocol}://{domain}:{username}:{password}`",
@@ -396,7 +412,10 @@ async def handle_start(message: Message, state: FSMContext) -> None:
 
 async def handle_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Сбросил текущую операцию. Напиши /start, чтобы начать заново.")
+    await _answer_with_retry(
+        message,
+        "Сбросил текущую операцию. Напиши /start, чтобы начать заново.",
+    )
 
 
 async def handle_input_mask(message: Message, state: FSMContext) -> None:
@@ -404,12 +423,13 @@ async def handle_input_mask(message: Message, state: FSMContext) -> None:
     try:
         _mask_to_regex(mask)
     except ValueError as exc:
-        await message.answer(str(exc))
+        await _answer_with_retry(message, str(exc))
         return
 
     await state.update_data(input_mask=mask)
     await state.set_state(ConversionStates.output_mask)
-    await message.answer(
+    await _answer_with_retry(
+        message,
         "Отлично! Теперь отправь маску нужной структуры.\n"
         "Используй те же имена плейсхолдеров, например: `{username}:{password}`",
         parse_mode=ParseMode.MARKDOWN,
@@ -419,13 +439,17 @@ async def handle_input_mask(message: Message, state: FSMContext) -> None:
 async def handle_output_mask(message: Message, state: FSMContext) -> None:
     mask = message.text or ""
     if not PLACEHOLDER_PATTERN.search(mask):
-        await message.answer("В маске должен быть хотя бы один плейсхолдер в фигурных скобках.")
+        await _answer_with_retry(
+            message,
+            "В маске должен быть хотя бы один плейсхолдер в фигурных скобках.",
+        )
         return
 
     await state.update_data(output_mask=mask)
 
     await state.set_state(ConversionStates.lines_per_file)
-    await message.answer(
+    await _answer_with_retry(
+        message,
         "Если хочешь разделить результат на несколько файлов, введи количество строк на один файл.\n"
         "Отправь 0 или слово 'skip', чтобы получить один файл.",
     )
@@ -435,7 +459,10 @@ async def handle_lines_per_file(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip().lower()
 
     if not text:
-        await message.answer("Пожалуйста, введи число строк или 0, чтобы пропустить.")
+        await _answer_with_retry(
+            message,
+            "Пожалуйста, введи число строк или 0, чтобы пропустить.",
+        )
         return
 
     if text in {"skip", "0", "нет", "no"}:
@@ -444,7 +471,10 @@ async def handle_lines_per_file(message: Message, state: FSMContext) -> None:
         try:
             lines_per_file = int(text)
         except ValueError:
-            await message.answer("Не удалось распознать число. Попробуй снова.")
+            await _answer_with_retry(
+                message,
+                "Не удалось распознать число. Попробуй снова.",
+            )
             return
 
         if lines_per_file <= 0:
@@ -452,10 +482,12 @@ async def handle_lines_per_file(message: Message, state: FSMContext) -> None:
 
     await state.update_data(lines_per_file=lines_per_file)
     await state.set_state(ConversionStates.waiting_file)
+
     await message.answer(
         "Отлично! Теперь пришли файл в виде документа или ссылку на файл/папку. "
         "Я верну его в нужном формате."
     )
+
 
 
 
@@ -475,12 +507,16 @@ def _output_filename(stem: str, part_index: int, total_parts: int) -> str:
     return f"{stem}_part_{part_index}.txt"
 
 
+
 async def _convert_and_send(
+
     message: Message,
     state: FSMContext,
     file_content: bytes,
     source_name: Optional[str] = None,
+
 ) -> bool:
+
     data = await state.get_data()
     input_mask = data.get("input_mask")
     output_mask = data.get("output_mask")
@@ -488,19 +524,23 @@ async def _convert_and_send(
     lines_per_file = int(data.get("lines_per_file", 0) or 0)
 
     if not input_mask or not output_mask:
+
         await message.answer("Сначала отправь маски с помощью команды /start.")
         return False
+
 
     text = file_content.decode("utf-8", errors="ignore")
     try:
         converted_lines = _convert_lines(text.splitlines(), input_mask, output_mask)
     except ValueError as exc:
+
         await message.answer(f"Не удалось преобразовать файл: {exc}")
         return False
 
     if not converted_lines:
         await message.answer("Не удалось найти строки, подходящие под входную маску.")
         return False
+
 
     if lines_per_file > 0:
         chunks = [
@@ -512,9 +552,11 @@ async def _convert_and_send(
 
     if len(chunks) > 1:
         details = f" для {source_name}" if source_name else ""
+
         await message.answer(
             f"Готово! Разбил результат на {len(chunks)} файла(ов){details}."
         )
+
 
     stem = _output_stem_from_source(source_name)
     for idx, chunk in enumerate(chunks, start=1):
@@ -541,6 +583,7 @@ async def _convert_and_send(
             return False
 
     return True
+
 
 
 async def handle_file(message: Message, state: FSMContext, bot: Bot) -> None:
@@ -605,6 +648,162 @@ async def handle_file_link(message: Message, state: FSMContext) -> None:
             await message.answer("Готово! Обработал все доступные файлы по ссылке.")
 
 
+async def handle_file_link(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    match = URL_PATTERN.search(text)
+    if not match:
+        await _answer_with_retry(
+            message,
+            "Пожалуйста, отправь документ или ссылку на файл/папку в Google Drive или на Яндекс Диске.",
+        )
+        return
+
+    url = _strip_trailing_punctuation(match.group(0))
+
+    try:
+        files = await _download_files_from_link(url)
+    except ValueError as exc:
+        await _answer_with_retry(message, str(exc))
+        return
+    except aiohttp.ClientError:
+        await _answer_with_retry(
+            message,
+            "Не удалось скачать файл по ссылке. Попробуй позже или отправь документ.",
+        )
+        return
+
+    if not files:
+        await _answer_with_retry(
+            message,
+            "Не удалось найти файлы по указанной ссылке.",
+        )
+        return
+
+    if len(files) > 1:
+        await _answer_with_retry(
+            message,
+            f"Нашёл {len(files)} файла(ов) по ссылке. Начинаю обработку...",
+        )
+
+    converted_entries: List[Tuple[str, bytes]] = []
+    archive_stem: Optional[str] = None
+    single_source_name: Optional[str] = None
+    success_any = False
+
+    for content, name in sorted(files, key=lambda item: item[1] or ""):
+        result = await _convert_file_to_outputs(message, state, content, source_name=name)
+        if not result:
+            continue
+
+        success_any = True
+        stem, outputs = result
+        if len(files) == 1:
+            archive_stem = stem
+            single_source_name = name
+
+        for filename, output_bytes in outputs:
+            relative_path = filename
+            if len(files) > 1:
+                relative_path = f"{stem}/{filename}"
+            converted_entries.append((relative_path, output_bytes))
+
+    if not success_any:
+        return
+
+    await state.clear()
+
+    if not converted_entries:
+        await _answer_with_retry(
+            message,
+            "Не удалось подготовить файлы для отправки.",
+        )
+
+        return
+
+    if len(converted_entries) == 1 and len(files) == 1:
+        filename, output_bytes = converted_entries[0]
+        caption = (
+            f"Готово! Вот преобразованный файл для {single_source_name}."
+            if single_source_name
+            else "Готово! Вот преобразованный файл."
+        )
+
+        await _send_document(message, output_bytes, filename, caption)
+        return
+
+    archive_stem = "converted_files" if len(files) > 1 else (archive_stem or "converted")
+
+    caption_base = "Готово! Вот архив с результатами."
+    if len(files) > 1:
+        caption_base = (
+            "Готово! Обработал все доступные файлы по ссылке. Вот архив с результатами."
+        )
+    elif single_source_name:
+        caption_base = f"Готово! Вот архив с результатами для {single_source_name}."
+
+    archives, oversized = _split_entries_into_archives(converted_entries, archive_stem)
+    if oversized:
+        filename, size = oversized
+        size_mb = size / (1024 * 1024)
+        await _answer_with_retry(
+            message,
+            "Не удалось отправить файл "
+            f"{filename}, потому что его размер после конвертации составляет {size_mb:.1f} МБ. "
+            "Попробуй уменьшить размер результата, например, уменьшив число строк в одном файле.",
+
+        )
+        return
+
+    if not archives:
+        await _answer_with_retry(
+            message,
+            "Не удалось подготовить архив для отправки.",
+        )
+        return
+
+    if len(archives) > 1:
+        await _answer_with_retry(
+            message,
+            "Итоговый архив получился слишком большим, поэтому разбил результаты на "
+            f"{len(archives)} части.",
+        )
+
+    total_parts = len(archives)
+    for index, (archive_name, archive_bytes) in enumerate(archives, start=1):
+        caption = caption_base
+        if total_parts > 1:
+            caption = f"{caption_base} Часть {index} из {total_parts}."
+        if index > 1:
+            await asyncio.sleep(1)
+        if not await _send_document(message, archive_bytes, archive_name, caption):
+            return
+
+    await _answer_with_retry(message, "Обработка завершена.")
+
+
+    total_parts = len(archives)
+    for index, (archive_name, archive_bytes) in enumerate(archives, start=1):
+        caption = caption_base
+        if total_parts > 1:
+            caption = f"{caption_base} Часть {index} из {total_parts}."
+        if index > 1:
+            await asyncio.sleep(1)
+        if not await _send_document(message, archive_bytes, archive_name, caption):
+            return
+
+    await _answer_with_retry(message, "Обработка завершена.")
+
+
+    try:
+        await message.answer_document(
+            BufferedInputFile(archive_buffer.getvalue(), filename=archive_name),
+            caption=caption,
+        )
+    except TelegramBadRequest:
+        await message.answer(
+            "Не удалось отправить файл. Попробуй файл меньшего размера."
+        )
+
 async def main() -> None:
     load_dotenv()
     token = os.environ.get("BOT_TOKEN")
@@ -613,7 +812,7 @@ async def main() -> None:
 
     logging.basicConfig(level=logging.INFO)
 
-    bot = Bot(token=token, parse_mode=ParseMode.HTML)
+    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
 
     dp.message.register(handle_start, CommandStart())
